@@ -1,8 +1,20 @@
-airport_dat_path:         "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
-nav_dat_path:             "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Resources/default data/earth_nav.dat"
+dats:
+    airport_dat_path:     "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
+    nav_dat_path:         "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Resources/default data/earth_nav.dat"
+    runways_dat_path:     "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Resources/plugins/PythonPlugins/xplane-12-landing-collector/utils/runways.dat"
+
+data_collection:
+    autostart:            False
+    screenshots_path:     "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Output/screenshots"
+    output_dir:           "/home/linok/Documents/xp12_dataset"
+    max_runways:          1000
+    episodes_per_launch:  50                      # restart XPlane to avoid buggy behavior
+    fps:                  50                      # don't forget to update this in XPlane-12
+    sim_speed:            5                       # fps / sim_speed = fps of gt
 
 airport:                                          # default is KSFO 28R
     airport_name:         "KSFO"
+    runway_name:          "28R"
     runway_length:        3048.0                  # meters
     runway_width:         61.0                    # meters
     r1_lat:               37.6135340              # degrees
@@ -15,15 +27,15 @@ airport:                                          # default is KSFO 28R
 
 descent:
     start_dist:           2.7                     # nautical miles
-    start_altitude:       300                     # meters; optional override
-    descent_speed:        80.0                    # km/h
+    start_altitude:       null                    # meters above runway; optional override, can be null
+    descent_speed:        80.0                    # knots
     descent_angle:        3.0                     # degrees
 
 environment:
     wind:
         max_wind_speed:   3.0                     # km/h
         max_gust_speed:   0.5                     # km/h
-        max_turbulence:   0.15                    # 0 <= x <= 1.0
+        max_turbulence:   0.05                    # 0 <= x <= 1.0
     visibility:
         min_visibility:   10.0                    # practically x < 15
         clear_chance:     0.75
@@ -31,9 +43,9 @@ environment:
         num_layers:       3
         bases:            [1500, 4000, 7000]      # meters
         tops:             [1800, 4300, 7300]      # meters
-        coverage:         [0.5, 0.3, 0.1]
+        coverage:         [0.8, 0.6, 0.3]
     rain:
-        max_rain:         1.0                     # 0 <= x <= 1.0
+        max_rain:         0.5                     # 0 <= x <= 1.0
         rain_chance:      0.3
     time:
         daytime_chance:   0.9

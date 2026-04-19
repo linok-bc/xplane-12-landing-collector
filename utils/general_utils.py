@@ -207,3 +207,15 @@ def clip_near_plane(clips, screen_pts, behind_flags, sw, sh):
                 ndc_y = interp[1] / interp[3]
                 result.append(((ndc_x + 1.0) * 0.5 * sw, (ndc_y + 1.0) * 0.5 * sh))
     return result
+
+def compute_bearing(lat1, lon1, lat2, lon2):
+    """Initial true bearing from point 1 to point 2, in degrees (0=N, 90=E)."""
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    
+    bearing = math.degrees(math.atan2(y, x))
+    return (bearing + 360) % 360

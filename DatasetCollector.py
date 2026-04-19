@@ -1,254 +1,154 @@
-"""
-Place in: <X-Plane 12>/Resources/plugins/PythonPlugins/
-
-Places the aircraft on final approach toward KSFO 28R.
-Computes heading and velocity from hardcoded start/end points.
-"""
-
 import os
+import sys
 import time
 import math
 import random
+import shutil
+from omegaconf import OmegaConf
 from XPPython3 import xp
+from pathlib import Path
+from contextlib import suppress
+from timezonefinder import TimezoneFinder
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from utils.dat_utils import parse_runways_dat
+from utils.general_utils import (
+    degrees_to_rads,
+    degrees_to_meters,
+    get_start_position,
+    euler_to_quaternion,
+    mat4_mul_vec4,
+    project_local_to_pixel,
+    get_runway_points,
+    clip_polygon_to_screen,
+    clip_near_plane,
+    compute_bearing
+)
+
+
 
 # ============================================================================
 # CONFIGURATION
+# 
+# Global variables used to control flight behavior. Read from conf_path for
+# defaults. Avoid overwriting these; they're meant to be overridden ever time
+# we switch airports.
 # ============================================================================
+
+conf_path = Path(__file__).resolve().parent / 'config.yaml'
+conf = OmegaConf.load(conf_path)
+dc, ap, desc, env = conf.data_collection, conf.airport, conf.descent, conf.environment
+
+# === AUTOSTART ===
+AUTOSTART           = dc.autostart
+
+# === DATASET COLLECTION ===
+RUNWAYS_DAT_PATH    = conf.dats.runways_dat_path
+SS_PATH             = dc.screenshots_path
+OUTPUT_DIR          = dc.output_dir
+MAX_RUNWAYS         = dc.max_runways
+EPISODES_PER_LAUNCH = dc.episodes_per_launch
+FPS                 = dc.fps
+SIM_SPEED           = dc.sim_speed
 
 # === AIRPORT ===
-AIRPORT = "KSFO"
-# these should not be writen directly, they're completely dependent on AIRPORT
-RUNWAY_LENGTH_M = 3048.0  # KSFO 28R length in meters
-RUNWAY_WIDTH_M = 61.0     # runway width in meters
-RUNWAY_CORNERS = None 
-THRESHOLD_LAT, THRESHOLD_LON = 37.6135340, -122.3571551
-THRESHOLD_LAT_FAR, THRESHOLD_LON_FAR = 37.6287597, -122.3934389
-THRESHOLD_HEAD = 298
-THRESHOLD_ELEV_M = 3.9624
-ILS_FREQ = 11170  # 111.70 MHz (I-GWQ)
+AIRPORT             = ap.airport_name
+RUNWAY_NAME         = ap.runway_name
+RUNWAY_WIDTH        = ap.runway_width
+R1_LAT              = ap.r1_lat
+R1_LONG             = ap.r1_long
+R2_LAT              = ap.r2_lat
+R2_LONG             = ap.r2_long
+HEADING             = ap.heading
+ELEV                = ap.elev
+ILS_FREQ            = ap.ils_freq
+# this needs to be computed
+RUNWAY_POINTS       = get_runway_points(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH)
+
+# === DESCENT ===
+START_DIST          = desc.start_dist
+DESCENT_SPEED       = desc.descent_speed
+DESCENT_ANGLE       = desc.descent_angle
+# this needs to be computed
+START_LAT, START_LONG, START_ALT= get_start_position(
+    R1_LAT, R1_LONG, HEADING, ELEV, START_DIST, DESCENT_ANGLE
+)
+# allow START_ALT to be overridden since sometimes the AI fails
+if conf.descent.start_altitude:
+    START_ALT = conf.descent.start_altitude
 
 # === WIND ===
-MAX_WIND_SPEED =    3.0 # m/s
-MAX_GUST_EXTRA =    0.5 # m/s
-MAX_TURBULENCE =    0.15
+MAX_WIND_SPEED      = env.wind.max_wind_speed
+MAX_GUST_SPEED      = env.wind.max_gust_speed
+MAX_TURB            = env.wind.max_turbulence
 
 # === VISIBILITY ===
-MIN_VISIBILITY =    10.0 # less than 15!
-NONCLEAR_CHANCE =   0.25
+MIN_VIS             = env.visibility.min_visibility
+CLEAR_CHANCE        = env.visibility.clear_chance
+
+# === CLOUDS ===
+NUM_CLOUD_LAYERS    = env.clouds.num_layers
+CLOUD_BASES         = list(env.clouds.bases)
+CLOUD_TOPS          = list(env.clouds.tops)
+CLOUD_COVERAGE      = list(env.clouds.coverage)
 
 # === RAIN ===
-MAX_RAIN =          1.0
-RAIN_CHANCE =       0.5
+MAX_RAIN            = env.rain.max_rain
+RAIN_CHANCE         = env.rain.rain_chance
 
 # === TIME OF DAY ===
-DAYTIME_CHANCE =    0.9
-TIMEZONE_OFFSET =   -8  # should never be directly written; will depend on AIRPORT
+tf = TimezoneFinder()
+DAYTIME_CHANCE      = env.time.daytime_chance
+# this needs to be computed
+TIMEZONE = tf.timezone_at(lat=R1_LAT, lng=R1_LONG)
+TIMEZONE_OFFSET= datetime.now(ZoneInfo(TIMEZONE)).utcoffset().total_seconds() / 3600
 
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def degrees_to_rads(deg: float):
-    return deg * (math.pi / 180)
-
-def degrees_to_meters(nm: float):
-    return nm * 60 * 1852
-
-def get_start_position(
-        rwy_lat: float,
-        rwy_lon: float,
-        rwy_head: float,
-        rwy_elev: float,
-        start_dist: float,
-        start_gamma
-    ):
-    """
-    [in]
-        rwy_lat (float): runway latitude in degrees (Earth distance)
-        rwy_lon (float): runway longitude in degrees (Earth distance)
-        rwy_head (float): runway orientation in degrees (angles)
-        rwy_elev (float): runway elevation above sea level in meters
-        start_dist (float): distance to start from in nautical miles
-        start_gamma (float): approach angle
-
-    [out]
-        start_lat (float): starting latitude in degrees
-        start_lon (float): starting longitude in degrees
-        start_alt (float): starting altitude of the plane in meters
-    """
-    # convert start_dist to degrees
-    start_dist = start_dist / 60
-
-    # apply offset to rwy_lat/long based on heading
-    start_lat = rwy_lat - start_dist * math.cos(degrees_to_rads(rwy_head))
-    start_lon = rwy_lon - start_dist * math.sin(degrees_to_rads(rwy_head)) / math.cos(degrees_to_rads(rwy_lat))
-    
-    # calculate starting angle
-    start_alt = rwy_elev + degrees_to_meters(start_dist) * math.tan(degrees_to_rads(start_gamma + 0.5))
-
-    return start_lat, start_lon, start_alt
-
-def euler_to_quaternion(psi_deg, theta_deg, phi_deg):
-    h = math.radians(psi_deg) / 2.0
-    p = math.radians(theta_deg) / 2.0
-    r = math.radians(phi_deg) / 2.0
-    ch, sh = math.cos(h), math.sin(h)
-    cp, sp = math.cos(p), math.sin(p)
-    cr, sr = math.cos(r), math.sin(r)
-    return [
-        cr * cp * ch + sr * sp * sh,
-        sr * cp * ch - cr * sp * sh,
-        cr * sp * ch + sr * cp * sh,
-        cr * cp * sh - sr * sp * ch,
-    ]
-
-def mat4_mul_vec4(m, v):
-    """Multiply a 16-float column-major OpenGL matrix by a 4-element vector."""
-    return [
-        m[0]*v[0] + m[4]*v[1] + m[8]*v[2]  + m[12]*v[3],
-        m[1]*v[0] + m[5]*v[1] + m[9]*v[2]  + m[13]*v[3],
-        m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3],
-        m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3],
-    ]
-
-def project_local_to_pixel(lx, ly, lz, world_mat, proj_mat, screen_w, screen_h):
-    eye = mat4_mul_vec4(world_mat, [lx, ly, lz, 1.0])
-    clip = mat4_mul_vec4(proj_mat, eye)
-
-    if clip[3] <= 0.0:
-        return (clip[0], clip[1], True, clip)
-
-    ndc_x = clip[0] / clip[3]
-    ndc_y = clip[1] / clip[3]
-
-    px = (ndc_x + 1.0) * 0.5 * screen_w
-    py = (ndc_y + 1.0) * 0.5 * screen_h
-    return (px, py, False, clip)
-
-
-def get_runway_points(lat1, lon1, lat2, lon2, width_m, n=20):
-    m_per_deg_lat = 111320.0
-    m_per_deg_lon = 111320.0 * math.cos(math.radians((lat1 + lat2) / 2))
-
-    dx = (lon2 - lon1) * m_per_deg_lon
-    dy = (lat2 - lat1) * m_per_deg_lat
-    length = math.sqrt(dx*dx + dy*dy)
-    
-    # Perpendicular offset
-    perp_lat = -dx / length * (width_m / 2) / m_per_deg_lat
-    perp_lon =  dy / length * (width_m / 2) / m_per_deg_lon
-
-    left, right = [], []
-    for i in range(n + 1):
-        frac = i / n
-        lat = lat1 + frac * (lat2 - lat1)
-        lon = lon1 + frac * (lon2 - lon1)
-        left.append((lat + perp_lat, lon + perp_lon, 0))
-        right.append((lat - perp_lat, lon - perp_lon, 0))
-
-    return left + list(reversed(right))
-
-
-
-# === APPROACH ===
-START_DIST = 2.7 # in nm
-START_GAMMA = 3.0
-START_LAT, START_LON, START_ALT_M = get_start_position(
-        THRESHOLD_LAT, 
-        THRESHOLD_LON,
-        THRESHOLD_HEAD,
-        THRESHOLD_ELEV_M, 
-        START_DIST, 
-        START_GAMMA,
-    )
-# START_ALT_M = 300
-
-APPROACH_SPEED_KTS = 90.0
-
-RUNWAY_CORNERS = get_runway_points(
-    THRESHOLD_LAT, THRESHOLD_LON,
-    THRESHOLD_HEAD, RUNWAY_LENGTH_M, RUNWAY_WIDTH_M, n=20
-)
-
-def clip_polygon_to_screen(vertices, screen_w, screen_h):
-    """
-    Sutherland-Hodgman clipping of a polygon to the screen rectangle.
-    vertices: list of (x, y) tuples.
-    Returns clipped list of (x, y) tuples.
-    """
-    def clip_edge(poly, x0, y0, x1, y1):
-        """Clip polygon against one edge defined by line from (x0,y0) to (x1,y1). 
-           Points to the LEFT of the edge (interior) are kept."""
-        if not poly:
-            return []
-        result = []
-        for i in range(len(poly)):
-            curr = poly[i]
-            prev = poly[i - 1]
-            curr_side = (x1 - x0) * (curr[1] - y0) - (y1 - y0) * (curr[0] - x0)
-            prev_side = (x1 - x0) * (prev[1] - y0) - (y1 - y0) * (prev[0] - x0)
-            if curr_side >= 0:
-                if prev_side < 0:
-                    result.append(_intersect(prev, curr, x0, y0, x1, y1))
-                result.append(curr)
-            elif prev_side >= 0:
-                result.append(_intersect(prev, curr, x0, y0, x1, y1))
-        return result
-
-    def _intersect(p1, p2, x0, y0, x1, y1):
-        dx, dy = x1 - x0, y1 - y0
-        dp_x, dp_y = p2[0] - p1[0], p2[1] - p1[1]
-        denom = dp_x * dy - dp_y * dx
-        if abs(denom) < 1e-10:
-            return p2
-        t = ((x0 - p1[0]) * dy - (y0 - p1[1]) * dx) / denom
-        return (p1[0] + t * dp_x, p1[1] + t * dp_y)
-
-    # Clip against all 4 screen edges (defined counter-clockwise)
-    poly = list(vertices)
-    poly = clip_edge(poly, 0, 0, screen_w, 0)          # bottom
-    poly = clip_edge(poly, screen_w, 0, screen_w, screen_h)  # right
-    poly = clip_edge(poly, screen_w, screen_h, 0, screen_h)  # top
-    poly = clip_edge(poly, 0, screen_h, 0, 0)          # left
-    return poly
-
-def clip_near_plane(clips, screen_pts, behind_flags, sw, sh):
-    NEAR_EPS = 0.01
-    n = len(screen_pts)
-    result = []
-    for i in range(n):
-        j = (i + 1) % n
-        if not behind_flags[i]:
-            result.append(screen_pts[i])
-        if behind_flags[i] != behind_flags[j]:
-            w_i = clips[i][3]
-            w_j = clips[j][3]
-            t = (NEAR_EPS - w_i) / (w_j - w_i)
-            t = max(0.0, min(1.0, t))
-            interp = [clips[i][k] + t * (clips[j][k] - clips[i][k]) for k in range(4)]
-            if interp[3] > 0:
-                ndc_x = interp[0] / interp[3]
-                ndc_y = interp[1] / interp[3]
-                result.append(((ndc_x + 1.0) * 0.5 * sw, (ndc_y + 1.0) * 0.5 * sh))
-    return result
-
-
+# ================================================================
+# PLUGIN IMPLEMENTATION
+# ================================================================
 class PythonInterface:
 
     def __init__(self):
         self.dr = {}
         self.cmd = {}
         self.menu_id = None 
-        self._placement_pending = False
+        
+        self._runways = []
+        self._runway_idx = 0
+        self._run_dir = ''
+        self._mon_accum = 0
+        self._mon_time_logger = []
+        self._mon_condition_logger = {}
+        self._mon_pose_logger = []
+        self._mon_position_logger = []
+        self._mon_poly_logger = []
+        self._is_running = False
+        self._world_mat = [0.0] * 16
+        self._proj_mat = [0.0] * 16
+        self._episodes_this_launch = 0
+
+    def __reset_monitor__(self):
+        self._mon_accum = 0
+        self._mon_time_logger = []
+        self._mon_pose_logger = []
+        self._mon_position_logger = []
+        self._mon_poly_logger = []
+
 
     def XPluginStart(self):
         return (
-            "XPPython3 Landing Data Collector",
+            "XPPython3 Landing Dataset Collector",
             "com.data_collection.landing",
-            "Collect many, many runway landing sequences"
+            "Collect runway landing sequences"
         )
-
+    # ============================================================
+    # DATAREFS AND COMMANDS
+    # 
+    # Refer to https://developer.x-plane.com/datarefs/ and
+    # https://siminnovations.com/xplane/command/index.php
+    # ============================================================
     def XPluginEnable(self):
         refs = {
             # OpenGL coordinates
@@ -271,7 +171,7 @@ class PythonInterface:
             
             # roll, pitch, and yaw rotation rates in local frame
             "P":                    "sim/flightmodel/position/P",
-            "Q_rate":               "sim/flightmodel/position/Q",
+            "Q":                    "sim/flightmodel/position/Q",
             "R":                    "sim/flightmodel/position/R",
             
             # monitoring air and groundspeed
@@ -281,7 +181,6 @@ class PythonInterface:
 
             # autopilot monitoring; we need to force autopilot the whole time to control gliding
             "ap":                   "sim/cockpit/autopilot/autopilot_mode",
-            "ap_state":             "sim/cockpit/autopilot/autopilot_state",
             
             # autopilot and plane control
             "ap_hdg":               "sim/cockpit/autopilot/heading_mag",
@@ -305,65 +204,73 @@ class PythonInterface:
             "wind_direction":       "sim/weather/region/wind_direction_degt",
             "wind_turbulence":      "sim/weather/region/turbulence",
 
-            # visibility
+            # visibility control
             "visibility":           "sim/weather/region/visibility_reported_sm",
 
-            # cloud cover
+            # cloud control
             "cloud_base":           "sim/weather/region/cloud_base_msl_m",
             "cloud_tops":           "sim/weather/region/cloud_tops_msl_m",
             "cloud_coverage":       "sim/weather/region/cloud_coverage_percent",
 
-            # rain
+            # rain control
             "rain_pct":             "sim/weather/region/rain_percent",
             
             # time of day; need to shift from UTC
-            "zulu_time":        "sim/time/zulu_time_sec",
-            "use_sys_time":     "sim/time/use_system_time",
+            "zulu_time":            "sim/time/zulu_time_sec",
+            "use_sys_time":         "sim/time/use_system_time",
 
             # world to camera transformations
-            "world_matrix":     "sim/graphics/view/world_matrix",
-            "proj_matrix":      "sim/graphics/view/projection_matrix_3d",
-            "screen_w":         "sim/graphics/view/window_width",
-            "screen_h":         "sim/graphics/view/window_height",
+            "world_matrix":         "sim/graphics/view/world_matrix",
+            "proj_matrix":          "sim/graphics/view/projection_matrix_3d",
+            "screen_w":             "sim/graphics/view/window_width",
+            "screen_h":             "sim/graphics/view/window_height",
 
             # speed up the sim for data collection purposes
             "sim_speed":            "sim/time/sim_speed",
             "sim_speed_actual" :    "sim/time/sim_speed_actual"
         }
+
         for key, path in refs.items():
             self.dr[key] = xp.findDataRef(path)
             if self.dr[key] is None:
-                xp.log(f"[AP] WARN: dataref not found: {path}")
+                xp.log(f"WARN: dataref not found: {path}")
 
-        # register relevant commands
         cmds = {
-            # for autopilot
-            "servos":   "sim/autopilot/servos_on",
-            "approach": "sim/autopilot/approach",
+            # autopilot
+            "servos":               "sim/autopilot/servos_on",
+            "approach":             "sim/autopilot/approach",
 
             # weather control
-            "regen_weather":    "sim/operation/regen_weather",
+            "regen_weather":        "sim/operation/regen_weather",
 
             # screen capture
-            "toggle_movie": "sim/operation/video_record_toggle",
+            "toggle_movie":         "sim/operation/video_record_toggle",
+
+            # quit
+            "quit":                 "sim/operation/quit",
         }
-        self.cmd = {}
+
         for key, path in cmds.items():
             self.cmd[key] = xp.findCommand(path)
+            if self.cmd[key] is None:
+                xp.log(f" WARN: command not found: {path}")
+        
+        # keep track of transformation matrices during draw phase
+        xp.registerDrawCallback(self._draw_cb, phase=xp.Phase_Window, after=0, refCon=None)
 
         # make interactable button in X-Plane
         idx = xp.appendMenuItem(xp.findPluginsMenu(), "Begin Data Collection", 0)
-        self.menu_id = xp.createMenu(
-            "Begin Data Collection", xp.findPluginsMenu(), idx, self._menu_cb
-        )
-        xp.appendMenuItem(self.menu_id, "Begin Data Colletion", "go")
-        xp.log("[DC] Plugin enabled.")
+        self.menu_id = xp.createMenu("Begin Data Collection", xp.findPluginsMenu(), idx, self._menu_cb)
+        xp.appendMenuItem(self.menu_id, "Begin Data Collection", "go")
+        xp.log(" Plugin enabled.")
+        xp.registerFlightLoopCallback(self._autostart_cb, interval=10.0)
         return 1
 
 
 
     def XPluginDisable(self):
         if self.menu_id:
+            xp.unregisterDrawCallback(self._draw_cb, phase=xp.Phase_Window, after=0, refCon=None)
             xp.destroyMenu(self.menu_id)
             self.menu_id = None
 
@@ -374,49 +281,268 @@ class PythonInterface:
 
 
 
+    # ============================================================
+    # MESSAGES
+    # ============================================================
     def XPluginReceiveMessage(self, fromWho, message, param):
-        # --- If the scene is loading, wait to start a run until the scene has loaded ---#
-        if message == 103 and self._placement_pending:  # XPLM_MSG_AIRPORT_LOADED
-            self._placement_pending = False
-            xp.registerFlightLoopCallback(self._place_on_approach, interval=1.0)
+        pass
 
 
-
-    def _menu_cb(self, menuRef, itemRef):
-        if itemRef == "go":
-            xp.log("[DC] === Starting data collection ===")
-            try:
-                xp.unregisterFlightLoopCallback(self._flare_loop)
-            except:
-                pass
-            try:
-                xp.unregisterFlightLoopCallback(self._monitor_loop)
-            except:
-                pass
-            xp.setDatai(self.dr["override_joystick"], 0)
-            self._placement_pending = True
-            xp.placeUserAtAirport(AIRPORT)
-
-
-
-    def _draw_cb(self, phase, is_before, refcon):
-        poly = self._get_runway_polygon()
-        label_path = os.path.join(self._label_dir, f"{self._frame_idx:06d}.txt")
+    # ============================================================
+    # ENVIRONMENT CONTROL
+    # ============================================================
+    def _randomize_wind(self):    
+        # Random surface wind
+        base_speed = random.uniform(0.0, MAX_WIND_SPEED)
+        base_dir = random.uniform(0.0, 360.0)
+        gust_extra = random.uniform(0.0, MAX_GUST_SPEED)
+        turb = random.uniform(0.0, MAX_TURB)
+    
+        # Fill all layers with similar values (slight increase with altitude)
+        speeds = [base_speed + gust_extra + i * 0.3 for i in range(13)]
+        dirs = [base_dir for _ in range(13)]
+        turbs = [turb for _ in range(13)]
+    
+        xp.setDatavf(self.dr["wind_speed"], speeds, 0, 13)
+        xp.setDatavf(self.dr["wind_direction"], dirs, 0, 13)
+        xp.setDatavf(self.dr["wind_turbulence"], turbs, 0, 13)
         
-        if poly:
-            coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
-            with open(label_path, "w") as f:
-                f.write(f"0 {coords}\n")
+        self._mon_condition_logger['wind'] = [base_speed, base_dir, turb]
+
+
+
+    def _randomize_visibility(self):
+        if random.random() < CLEAR_CHANCE:
+            vis = 15.0
         else:
-            # Empty file = no runway visible
-            open(label_path, "w").close()
+            vis = random.uniform(MIN_VIS, 15.0)
+        xp.setDataf(self.dr["visibility"], vis)
+        self._mon_condition_logger['vis'] = vis
+
+
+
+    def _set_clouds(self):
+        xp.setDatavf(self.dr["cloud_base"], CLOUD_BASES, 0, NUM_CLOUD_LAYERS)
+        xp.setDatavf(self.dr["cloud_tops"], CLOUD_TOPS, 0, NUM_CLOUD_LAYERS)
+        xp.setDatavf(self.dr["cloud_coverage"], CLOUD_COVERAGE, 0, NUM_CLOUD_LAYERS)
+
+
+
+    def _randomize_precipitation(self):
         
-        self._frame_idx += 1
+        if random.random() < RAIN_CHANCE:
+            rain = random.uniform(MAX_RAIN/2, MAX_RAIN)
+        else:
+            rain = 0.0
+        xp.setDataf(self.dr["rain_pct"], rain)
+        self._mon_condition_logger['rain'] = rain
+
+
+
+    def _randomize_time(self):
+        # Disable system time so our writes stick
+        xp.setDatai(self.dr["use_sys_time"], 0)
+    
+        if random.random() < DAYTIME_CHANCE:
+            # Daytime: 8am - 5pm local
+            local_sec = random.uniform(28800, 61200)
+        else:
+            # Nighttime: 8pm - 5am local
+            if random.random() < 0.5:
+                local_sec = random.uniform(72000, 86400)
+            else:
+                local_sec = random.uniform(0, 18000)
+    
+        zulu_sec = (local_sec - TIMEZONE_OFFSET * 3600) % 86400
+        xp.setDataf(self.dr["zulu_time"], zulu_sec)
+    
+        hours = int(local_sec // 3600)
+        mins = int((local_sec % 3600) // 60)
+        self._mon_condition_logger['daytime'] = 'true' if 28800 <= local_sec <= 61200 else 'false'
+   
+
+
+    def _count_completed_episodes(self, output_dir):
+        """Count dirs with a 'poly.txt' sentinel — written last in _flare_loop."""
+        if not os.path.isdir(output_dir):
+            return 0
+        count = 0
+        for name in os.listdir(output_dir):
+            d = os.path.join(output_dir, name)
+            if os.path.isdir(d) and os.path.isfile(os.path.join(d, 'poly.txt')):
+                count += 1
+        return count
+
+
+    def _draw_cb(self, phase, after, refcon):
+        # Cache the matrices every frame
+        self._world_mat = [0.0] * 16
+        xp.getDatavf(self.dr["world_matrix"], self._world_mat, 0, 16)
+        self._proj_mat = [0.0] * 16
+        xp.getDatavf(self.dr["proj_matrix"], self._proj_mat, 0, 16)
+        self._sw = xp.getDatai(self.dr["screen_w"])
+        self._sh = xp.getDatai(self.dr["screen_h"])
         return 1
 
+    # ============================================================
+    # AUTOSTART AND QUIT (FOR XP REFRESHES)
+    # ============================================================
+    def _autostart_cb(self, since_last, elapsed, counter, refcon):
+        if AUTOSTART:
+            self._menu_cb(None, "go")
+        return 0
+    def _quit_cb(self, since_last, elapsed, counter, refcon):
+        xp.commandOnce(self.cmd["quit"])
+        return 0
 
 
+
+    # ============================================================
+    # START BEHAVIOR
+    # ============================================================
+    def _menu_cb(self, menuRef, itemRef):
+        if itemRef == "go" and self._is_running == False:
+            try:
+                self._is_running = True
+                
+                xp.log(" === Setting up output directory ===")
+                
+                # make output directory, replace screenshot with symlink to output
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                p = Path(SS_PATH)
+                if p.is_symlink() or p.is_file():
+                    p.unlink()
+                elif p.exists():
+                    shutil.rmtree(p)
+                os.symlink(OUTPUT_DIR, SS_PATH, target_is_directory=True)
+
+                xp.log(" === Retrieve runway data ===")
+                runways = parse_runways_dat(RUNWAYS_DAT_PATH)
+                max_runways = min(len(runways), MAX_RUNWAYS)
+                xp.log(f"Found {len(runways)} runways, using {max_runways} runways")
+                self._runways = runways[:max_runways]
+
+                # check for start point
+                completed = self._count_completed_episodes(OUTPUT_DIR)
+                xp.log(f"Found {completed} completed episodes on disk")
+                self._runway_idx = completed
+
+                if completed >= max_runways:
+                    xp.log(" === Dataset complete ===")
+                    Path(OUTPUT_DIR, "DONE").touch()
+                    xp.commandOnce(self.cmd["quit"])
+                    return
+                
+                # set up clouds + rain and increase sim speed
+                self._set_clouds()
+                self._randomize_precipitation()
+                xp.setDatai(self.dr["weather_source"], 1)
+                xp.setDatai(self.dr["update_immediately"], 1)
+                xp.commandOnce(self.cmd["regen_weather"])
+                xp.setDatai(self.dr["sim_speed"], SIM_SPEED)
+                
+                # loop for all runways
+                xp.log(" === Begin flight loop ===")
+                self._start_next_flight()
+            except Exception as e:
+                import traceback
+                xp.log(f"ERROR: {e}\n{traceback.format_exc()}")
+
+    # ============================================================
+    # DESCENT FLARE LOOP
+    # ============================================================
+    def _start_next_flight(self):
+        # check if we are done; else, fetch the runway
+        if self._runway_idx >= len(self._runways):
+            xp.log(" === All runways complete ===")
+            self._is_running = False
+            return
+        r = self._runways[self._runway_idx]
+        counter = self._runway_idx + 1
+
+        # per-launch restart check
+        if self._episodes_this_launch >= EPISODES_PER_LAUNCH:
+            xp.log(f" === Hit {EPISODES_PER_LAUNCH} episodes this launch, restarting ===")
+            self._is_running = False
+            # let any pending writes settle
+            xp.registerFlightLoopCallback(self._quit_cb, interval=3.0)
+            return
+        
+        # reference global variables
+        global AIRPORT, RUNWAY_NAME, RUNWAY_WIDTH
+        global R1_LAT, R1_LONG, R2_LAT, R2_LONG
+        global HEADING, ELEV, ILS_FREQ
+        global RUNWAY_POINTS, START_LAT, START_LONG, START_ALT
+        global TIMEZONE, TIMEZONE_OFFSET
+
+        # update global variables based on new parameters
+        AIRPORT = r['airport_name']
+        RUNWAY_NAME = r['runway_name']
+        RUNWAY_WIDTH = r['runway_width']
+        R1_LAT = r['r1_lat']
+        R1_LONG = r['r1_long']
+        R2_LAT = r['r2_lat']
+        R2_LONG = r['r2_long']
+        HEADING = r['heading']
+        ELEV = r['elev']
+        ILS_FREQ = r['ils']
+        
+        # these needs to be computed
+        RUNWAY_POINTS = get_runway_points(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH)
+        START_LAT, START_LONG, START_ALT= get_start_position(
+            R1_LAT, R1_LONG, HEADING, ELEV, START_DIST, DESCENT_ANGLE
+        )
+        if conf.descent.start_altitude:
+            START_ALT = conf.descent.start_altitude
+        TIMEZONE = tf.timezone_at(lat=R1_LAT, lng=R1_LONG) or "UTC"
+        TIMEZONE_OFFSET = datetime.now(ZoneInfo(TIMEZONE)).utcoffset().total_seconds() / 3600
+            
+        # update location symlinks to point to idx
+        self._run_dir = os.path.join(OUTPUT_DIR, f"{counter:06}")
+        os.makedirs(self._run_dir, exist_ok=True)
+        p = Path(SS_PATH)
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+        elif p.exists():
+            shutil.rmtree(p)
+        os.symlink(self._run_dir, SS_PATH, target_is_directory=True)
+
+        # reset monitor variables
+        self.__reset_monitor__()
+
+        # Randomize environment conditions (except cloud cover and precipitation)
+        self._randomize_wind()
+        self._randomize_visibility()
+        self._randomize_time()
+        xp.setDatai(self.dr["weather_source"], 1)
+        xp.setDatai(self.dr["update_immediately"], 1)
+        xp.commandOnce(self.cmd["regen_weather"])
+
+        # disable previous controls from previous
+        with suppress(Exception): xp.unregisterFlightLoopCallback(self._flare_loop)
+        with suppress(Exception): xp.unregisterFlightLoopCallback(self._monitor_loop)
+        xp.setDatai(self.dr["override_joystick"], 0)
+        
+        # delayed placement at the new airport
+        xp.placeUserAtAirport(AIRPORT)
+        xp.registerFlightLoopCallback(self._place_on_approach, interval=1.0)
+
+    # ============================================================
+    # CALLBACK FOR NEXT FLIGHT
+    #
+    # Calling _start_next_flight directly in _flare_loop seems to
+    # occassionally crash XPlane-12 due to race conditions
+    # ============================================================
+    def _advance_cb(self, since_last, elapsed, counter, refcon):
+        self._start_next_flight()
+        return 0   # one-shot
+
+
+    # ============================================================
+    # DESCENT FLARE LOOP
+    # ============================================================
     def _flare_loop(self, since_last, elapsed, counter, refcon):
+
         # monitor the flight; once we get too low, we need to flare for the landing sequence
         if not hasattr(self, '_flare_startup'):
             self._flare_startup = 0.0
@@ -428,44 +554,75 @@ class PythonInterface:
         ias = xp.getDataf(self.dr["ias"])
         
         # --- THROTTLE: maintain target speed throughout ---
-        if agl > 50:
+        if agl > 40:
             # Simple speed control: if too fast reduce throttle, if too slow increase
-            speed_error = ias - APPROACH_SPEED_KTS
-            throttle = 0.5 - (speed_error / 50.0)
+            speed_error = ias - DESCENT_SPEED
+            throttle = 0.5 - (speed_error / 40.0)
             throttle = max(0.0, min(1.0, throttle))
             xp.setDataf(self.dr["thro_cmd"], throttle)
         
         # --- FLARE: below 50ft, take over from AP ---
-        if agl < 50:
+        if agl < 40:
             xp.setDatai(self.dr["override_joystick"], 1)
             
             # Hold wings level
             phi = xp.getDataf(self.dr["phi"])
             xp.setDataf(self.dr["yoke_roll"], max(-1.0, min(1.0, -phi / 25.0)))
             
-            # Hold heading
-            psi = xp.getDataf(self.dr["psi"])
-            heading_error = THRESHOLD_HEAD - psi
-            while heading_error > 180: heading_error -= 360
-            while heading_error < -180: heading_error += 360
-            xp.setDataf(self.dr["yoke_heading"], max(-1.0, min(1.0, heading_error / 20.0)))
-            
-            if agl > 15:
-                xp.setDataf(self.dr["yoke_pitch"], 0.05)
-                xp.setDataf(self.dr["thro_cmd"], 0.15)
-            elif agl > 5:
-                xp.setDataf(self.dr["yoke_pitch"], 0.15)
-                xp.setDataf(self.dr["thro_cmd"], 0.0)
-            else:
-                xp.setDataf(self.dr["yoke_pitch"], 0.2)
-                xp.setDataf(self.dr["thro_cmd"], 0.0)
+            # pitch: ramps from 0.3 at 50ft
+            target_pitch = 0.3 + (1.0 - agl/40.0) * 0.2
+            # throttle: ramps from 0.2 at 50ft
+            target_throttle = 0.2 - (1.0 - agl/40.0) * 0.15
+            xp.setDataf(self.dr["yoke_pitch"], target_pitch)
+            xp.setDataf(self.dr["thro_cmd"], target_throttle)
         
         # Touchdown
         if agl < 5 or xp.getDatai(self.dr["gnd"]):
             xp.setDatai(self.dr["override_joystick"], 0)
             xp.setDataf(self.dr["thro_cmd"], 0.0)
-            xp.log(f"[AP] Touchdown! IAS={ias:.0f}")
             xp.commandOnce(self.cmd["toggle_movie"])
+            with suppress(Exception): xp.unregisterFlightLoopCallback(self._monitor_loop)
+            
+            # write monitored conditions to file
+            gt_meta_path = os.path.join(self._run_dir, 'meta.txt')
+            gt_pose_path = os.path.join(self._run_dir, 'pose.txt')
+            gt_position_path = os.path.join(self._run_dir, 'position.txt')
+            gt_poly_path = os.path.join(self._run_dir, 'poly.txt')
+
+            with open(gt_meta_path, 'w') as fp:
+                fp.write(f'{AIRPORT} {RUNWAY_NAME}\n')
+                env_cond = ' '.join([
+                    str(self._mon_condition_logger['wind'][0]),
+                    str(self._mon_condition_logger['wind'][1]),
+                    str(self._mon_condition_logger['wind'][2]),
+                    str(self._mon_condition_logger['vis']),
+                    str(self._mon_condition_logger['rain']),
+                    self._mon_condition_logger['daytime'],
+                ])
+                fp.write(env_cond + '\n')
+                for t in self._mon_time_logger:
+                    fp.write(str(t) + '\n')
+
+            with open(gt_pose_path, 'w') as fp:
+                for q in self._mon_pose_logger:
+                    fp.write(f'{q[0]} {q[1]} {q[2]} {q[3]}\n')
+            
+            with open(gt_position_path, 'w') as fp:
+                for x, y, z in self._mon_position_logger:
+                    fp.write(f'{x} {y} {z}\n')
+
+            with open(gt_poly_path, 'w') as fp:
+                for poly in self._mon_poly_logger:
+                    poly = [f"{p[0]} {p[1]}" for p in poly]
+                    if len(poly) == 0:
+                        fp.write(f'\n')
+                    else:
+                        fp.write(' '.join(poly) + '\n')
+
+            # move onto next flight; slightly delay to avoid race conditions
+            self._runway_idx += 1
+            self._episodes_this_launch += 1
+            xp.registerFlightLoopCallback(self._advance_cb, interval=0.5)
             return 0
         
         return -1
@@ -478,10 +635,6 @@ class PythonInterface:
         normalized 0-1, or None if runway not visible.
         """
         # Read matrices
-        world_mat = [0.0] * 16
-        proj_mat = [0.0] * 16
-        xp.getDatavf(self.dr["world_matrix"], world_mat, 0, 16)
-        xp.getDatavf(self.dr["proj_matrix"], proj_mat, 0, 16)
         sw = xp.getDatai(self.dr["screen_w"])
         sh = xp.getDatai(self.dr["screen_h"])
     
@@ -492,9 +645,9 @@ class PythonInterface:
         screen_pts = []
         behind_flags = []
         clips = []
-        for lat, lon, elev in RUNWAY_CORNERS:
+        for lat, lon, elev in RUNWAY_POINTS:
             lx, ly, lz = xp.worldToLocal(lat, lon, elev)
-            px, py, behind, clip = project_local_to_pixel(lx, ly, lz, world_mat, proj_mat, sw, sh)
+            px, py, behind, clip = project_local_to_pixel(lx, ly, lz, self._world_mat, self._proj_mat, sw, sh)
             screen_pts.append((px, py))
             behind_flags.append(behind)
             clips.append(clip)
@@ -526,165 +679,53 @@ class PythonInterface:
 
 
 
+    # ============================================================
+    # MONITOR AND COLLECT GT LABELS
+    # ============================================================
     def _monitor_loop(self, since_last, elapsed, counter, refcon):
-        if not hasattr(self, '_mon_accum'):
-            self._mon_accum = 0.0
         self._mon_accum += since_last
+        agl = xp.getDataf(self.dr["agl"])
+
+        # capture quaternions for rotation
+        q = [0.0] * 4
+        xp.getDatavf(self.dr['q'], q, 0, 4)
+
+        # capture location
+        rx, ry, rz = xp.worldToLocal(R1_LAT, R1_LONG, ELEV)
+        x = xp.getDatad(self.dr['lx']) - rx
+        y = xp.getDataf(self.dr['agl'])
+        z = xp.getDatad(self.dr['lz']) - rz
         
-        if self._mon_accum >= 0.10:
-            self._mon_accum = 0.0
-            agl = xp.getDataf(self.dr["agl"])
-            ap_mode = xp.getDatai(self.dr["ap"])
-            ap_state = xp.getDatai(self.dr["ap_state"])
-            heading = xp.getDataf(self.dr["psi"])
-            pitch = xp.getDataf(self.dr["theta"])
-            speed = xp.getDataf(self.dr["ias"])
-            sim_speed_actual = xp.getDataf(self.dr["sim_speed_actual"])
+        # converted captured locations from absolute offset to relative to the landing strip
+        h = math.radians(HEADING)
+        cos_h, sin_h = math.cos(h), math.sin(h)
+        _x = x * sin_h - z * cos_h   # positive = past threshold (down the runway)
+        _z = x * cos_h + z * sin_h   # positive = right of centerline (facing forward)
+        x, z = _x, _z
 
-            poly = self._get_runway_polygon()
-            label_path = os.path.join(self._label_dir, f"{self._frame_idx:06d}.txt")
-            if poly:
-                # YOLO format: class_id x1 y1 x2 y2 ... xn yn
-                coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
-                label_line = f"0 {coords}\n"  # class 0 = runway
-                with open(label_path, "w") as f:
-                    f.write(label_line)
-            else:
-                label_line = "\n"
-                open(label_path, "w").close()
+        # get polygon of runway
+        poly = self._get_runway_polygon()
 
-            self._frame_idx += 1
-            xp.log(f"[MON] AGL={agl:.0f} AP={ap_mode} AP_state={ap_state}")
-        
-        if agl < 5 or xp.getDatai(self.dr["gnd"]):
-            return 0
-        
-        return 0.05
-
-
-
-    def _randomize_wind(self):
-        # Take control of weather from X-Plane
-        xp.setDatai(self.dr["weather_source"], 1)  # 1 = manual/plugin
-        xp.setDatai(self.dr["update_immediately"], 1)
-    
-        # Random surface wind: 0-15 kts -> 0-7.7 m/s
-        base_speed = random.uniform(0.0, MAX_WIND_SPEED)
-        base_dir = random.uniform(0.0, 360.0)
-        gust_extra = random.uniform(0.0, MAX_GUST_EXTRA)  # up to ~5 kts gust on top
-        turb = random.uniform(0.0, MAX_TURBULENCE)
-    
-        # Fill all layers with similar values (slight increase with altitude)
-        speeds = [base_speed + i * 0.3 for i in range(13)]
-        dirs = [base_dir for _ in range(13)]
-        turbs = [turb for _ in range(13)]
-    
-        xp.setDatavf(self.dr["wind_speed"], speeds, 0, 13)
-        xp.setDatavf(self.dr["wind_direction"], dirs, 0, 13)
-        xp.setDatavf(self.dr["wind_turbulence"], turbs, 0, 13)
-    
-        xp.commandOnce(self.cmd["regen_weather"])
-        xp.log(f"[DC] Wind: {base_speed:.1f} m/s from {base_dir:.0f}°, turb={turb:.2f}")
-
-
-
-    def _randomize_visibility(self):
-        if random.random() > NONCLEAR_CHANCE:
-            vis = 15.0
+        # write to loggers for future writing
+        self._mon_time_logger.append(self._mon_accum)
+        self._mon_pose_logger.append(q)
+        self._mon_position_logger.append([x, y, z])
+        if poly:
+            self._mon_poly_logger.append(poly)
         else:
-            vis = random.uniform(MIN_VISIBILITY, 15.0)
-        xp.setDataf(self.dr["visibility"], vis)
-        xp.log(f"[DC] Visibility: {vis:.1f} SM")
+            self._mon_poly_logger.append([])
 
-
-
-    def _randomize_clouds(self):
-        n_layers = 3
-
-        bases = []
-        tops = []
-        coverages = []
-        for i in range(n_layers):
-            if i == 0:
-                # Main layer: 600-3000m MSL, 0-50% coverage
-                base = random.uniform(600.0, 3000.0)
-                coverage = random.uniform(0.0, 0.5)
-            else:
-                # Upper layers: higher, thinner
-                base = random.uniform(3000.0 + i * 1000, 6000.0 + i * 1000)
-                coverage = random.uniform(0.0, 0.2)
-            top = base + random.uniform(100.0, 500.0)
-            bases.append(base)
-            tops.append(top)
-            coverages.append(coverage)
-
-        xp.setDatavf(self.dr["cloud_base"], bases, 0, n_layers)
-        xp.setDatavf(self.dr["cloud_tops"], tops, 0, n_layers)
-        xp.setDatavf(self.dr["cloud_coverage"], coverages, 0, n_layers)
-        xp.log(f"[DC] Clouds: base={bases[0]:.0f}m cov={coverages[0]:.0%}")
-
-
-
-    def _randomize_precipitation(self):
-        # Scale rain to lowest cloud layer's coverage
-        coverages = [0.0] * 3
-        xp.getDatavf(self.dr["cloud_coverage"], coverages, 0, 3)
-        max_coverage = max(coverages)
-        if max_coverage < 0.3:
-            rain = 0.0  # no rain with sparse clouds
-        else:
-            if random.random() < RAIN_CHANCE:
-                rain = random.uniform(0.0, MAX_RAIN) * (max_coverage / 0.5)
-            else:
-                rain = 0.0
-        xp.setDataf(self.dr["rain_pct"], rain)
-        xp.log(f"[DC] Rain: {rain:.2f} (cloud coverage: {max_coverage:.2f})")
-
-
-
-    def _randomize_time(self):
-        # Disable system time so our writes stick
-        xp.setDatai(self.dr["use_sys_time"], 0)
-    
-        UTC_OFFSET = -7  # KSFO PDT; change to -8 for PST
-    
-        if random.random() < DAYTIME_CHANCE:
-            # Daytime: 8am - 5pm local
-            local_sec = random.uniform(28800, 61200)
-        else:
-            # Nighttime: 8pm - 5am local
-            if random.random() < 0.5:
-                local_sec = random.uniform(72000, 86400)
-            else:
-                local_sec = random.uniform(0, 18000)
-    
-        zulu_sec = (local_sec - UTC_OFFSET * 3600) % 86400
-        xp.setDataf(self.dr["zulu_time"], zulu_sec)
-    
-        hours = int(local_sec // 3600)
-        mins = int((local_sec % 3600) // 60)
-        xp.log(f"[DC] Time: {hours:02d}:{mins:02d} local ({'day' if 28800 <= local_sec <= 61200 else 'night'})")
+        # else, delay next callback based on intended FPS
+        return (1 / FPS)
 
 
 
     def _place_on_approach(self, since_last, elapsed, counter, refcon):
-
-        self._placement_pending = False
-
-        self._frame_idx = 0
-        self._label_dir = "/home/linok/Downloads/test_labels"
-        os.makedirs(self._label_dir, exist_ok=True)
-
-        # Randomize conditions
-        self._randomize_wind()
-        self._randomize_visibility()
-        self._randomize_clouds()
-        self._randomize_precipitation()
-        self._randomize_time()
-
         # Convert both points to X-Plane local coords
-        sx, sy, sz = xp.worldToLocal(START_LAT, START_LON, START_ALT_M)
-        tx, ty, tz = xp.worldToLocal(THRESHOLD_LAT, THRESHOLD_LON, THRESHOLD_ELEV_M)
+        tx, ty, tz = xp.worldToLocal(R1_LAT, R1_LONG, ELEV)
+        sx, sy, sz = xp.worldToLocal(START_LAT, START_LONG, START_ALT)
+        if conf.descent.start_altitude:
+            sy = ty + START_ALT
 
         # Compute true heading from start to threshold using local coords
         # X-Plane: +X=east, +Y=up, +Z=south
@@ -695,9 +736,6 @@ class PythonInterface:
         true_heading = math.degrees(math.atan2(dx, -dz)) % 360.0
         horiz_dist = math.sqrt(dx*dx + dz*dz)
         pitch = -math.degrees(math.atan2(-dy, horiz_dist))
-
-        xp.log(f"[DC] True heading: {true_heading:.1f}, pitch: {pitch:.1f}")
-        xp.log(f"[DC] Threshold local: ({tx:.0f}, {ty:.0f}, {tz:.0f})")
 
         # === POSITION ===
         xp.setDatad(self.dr["lx"], sx)
@@ -712,12 +750,12 @@ class PythonInterface:
         xp.setDataf(self.dr["phi"], 0.0)
 
         # === VELOCITY toward threshold ===
-        speed_ms = APPROACH_SPEED_KTS * 0.5144
+        speed_ms = DESCENT_SPEED * 0.5144
         xp.setDataf(self.dr["vx"], speed_ms * dx / dist)
         xp.setDataf(self.dr["vy"], speed_ms * dy / dist)
         xp.setDataf(self.dr["vz"], speed_ms * dz / dist)
         xp.setDataf(self.dr["P"], 0.0)
-        xp.setDataf(self.dr["Q_rate"], 0.0)
+        xp.setDataf(self.dr["Q"], 0.0)
         xp.setDataf(self.dr["R"], 0.0)
 
         # === THROTTLE ===
@@ -726,34 +764,22 @@ class PythonInterface:
         # === RADIOS ===
         xp.setDatai(self.dr["hsi_src"], 0)
         xp.setDatai(self.dr["nav1"], ILS_FREQ)
-        xp.setDataf(self.dr["nav1_obs"], THRESHOLD_HEAD)
+        xp.setDataf(self.dr["nav1_obs"], HEADING)
 
         # === AUTOPILOT ===
-        xp.setDataf(self.dr["ap_hdg"], THRESHOLD_HEAD)
+        xp.setDataf(self.dr["ap_hdg"], HEADING)
         xp.setDatai(self.dr["ap"], 2)
         xp.commandOnce(self.cmd["servos"])
         xp.commandOnce(self.cmd["approach"])
 
-        ap_state = xp.getDatai(self.dr["ap_state"])
-        xp.log(f"[DC] Start: ({sx:.0f}, {sy:.0f}, {sz:.0f})")
-        xp.log(f"[DC] AP state: {ap_state} ({bin(ap_state)})")
-        xp.log("[DC] === Done ===")
-        
-        agl = xp.getDataf(self.dr["agl"])
-        ap_mode = xp.getDatai(self.dr["ap"])
-        
         # === FLARE LOOP === #
         self._flare_startup = 0.0
         xp.registerFlightLoopCallback(self._flare_loop, interval=-1)
-        xp.registerFlightLoopCallback(self._monitor_loop, interval=-1)
-
-        # === CAMERA CONTROL === #
-        # xp.controlCamera(xp.ControlCameraUntilViewChanges, self._camera_cb)
-
-        # === SPEEEEEEED === #
-        # xp.setDatai(self.dr["sim_speed"], 3)
 
         # === RECORDING === #
         xp.commandOnce(self.cmd["toggle_movie"])
+
+        # === MONITOR LOOP ===
+        xp.registerFlightLoopCallback(self._monitor_loop, interval=-1)
 
         return 0
