@@ -65,7 +65,7 @@ HEADING             = ap.heading
 ELEV                = ap.elev
 ILS_FREQ            = ap.ils_freq
 # this needs to be computed
-RUNWAY_POINTS       = get_runway_points(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH)
+RUNWAY_POINTS       = get_runway_points(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH, ELEV)
 
 # === DESCENT ===
 START_DIST          = desc.start_dist
@@ -119,7 +119,6 @@ class PythonInterface:
         self._runway_idx = 0
         self._run_dir = ''
         self._mon_accum = 0
-        self._mon_time_logger = []
         self._mon_condition_logger = {}
         self._mon_pose_logger = []
         self._mon_position_logger = []
@@ -131,7 +130,6 @@ class PythonInterface:
 
     def __reset_monitor__(self):
         self._mon_accum = 0
-        self._mon_time_logger = []
         self._mon_pose_logger = []
         self._mon_position_logger = []
         self._mon_poly_logger = []
@@ -488,7 +486,7 @@ class PythonInterface:
         ILS_FREQ = r['ils']
         
         # these needs to be computed
-        RUNWAY_POINTS = get_runway_points(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH)
+        RUNWAY_POINTS = get_runway_points(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH, ELEV)
         START_LAT, START_LONG, START_ALT= get_start_position(
             R1_LAT, R1_LONG, HEADING, ELEV, START_DIST, DESCENT_ANGLE
         )
@@ -600,8 +598,6 @@ class PythonInterface:
                     self._mon_condition_logger['daytime'],
                 ])
                 fp.write(env_cond + '\n')
-                for t in self._mon_time_logger:
-                    fp.write(str(t) + '\n')
 
             with open(gt_pose_path, 'w') as fp:
                 for q in self._mon_pose_logger:
@@ -707,7 +703,6 @@ class PythonInterface:
         poly = self._get_runway_polygon()
 
         # write to loggers for future writing
-        self._mon_time_logger.append(self._mon_accum)
         self._mon_pose_logger.append(q)
         self._mon_position_logger.append([x, y, z])
         if poly:

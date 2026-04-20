@@ -4,7 +4,7 @@ dats:
     runways_dat_path:     "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Resources/plugins/PythonPlugins/xplane-12-landing-collector/utils/runways.dat"
 
 data_collection:
-    autostart:            False
+    autostart:            True
     screenshots_path:     "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Output/screenshots"
     output_dir:           "/home/linok/Documents/xp12_dataset"
     max_runways:          1000

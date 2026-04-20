@@ -113,7 +113,7 @@ def project_local_to_pixel(lx, ly, lz, world_mat, proj_mat, screen_w, screen_h):
     return (px, py, False, clip)
 
 
-def get_runway_points(lat1, lon1, lat2, lon2, width_m, n=20):
+def get_runway_points(lat1, lon1, lat2, lon2, width_m, elev, n=20):
     """
     fetch the coordinates of each runway center, then convert to a polygon
 
@@ -141,8 +141,8 @@ def get_runway_points(lat1, lon1, lat2, lon2, width_m, n=20):
         frac = i / n
         lat = lat1 + frac * (lat2 - lat1)
         lon = lon1 + frac * (lon2 - lon1)
-        left.append((lat + perp_lat, lon + perp_lon, 0))
-        right.append((lat - perp_lat, lon - perp_lon, 0))
+        left.append((lat + perp_lat, lon + perp_lon, elev))
+        right.append((lat - perp_lat, lon - perp_lon, elev))
 
     return left + list(reversed(right))
 
