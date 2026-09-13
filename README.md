@@ -8,7 +8,8 @@ This package requires some dependencies that are installed via pip. XPPython com
 cd "<PATH_TO_XPLANE>"
 Resources/plugins/XPPython3/lin_x64/python3.12/bin/python3.12 -sm pip install \
 omegaconf \
-timezonefinder
+timezonefinder \
+opencv-python
 ```
 
 For video saving, we will be replacing the default location that X-Plane saves videos with a symlink to where we want our data to be stored. The base location is `<PATH_TO_XPLANE>/Outputs/screenshots`. Please back up your files if you have any there.
