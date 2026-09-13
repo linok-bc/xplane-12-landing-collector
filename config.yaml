@@ -7,10 +7,14 @@ data_collection:
     autostart:            True
     screenshots_path:     "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Output/screenshots"
     output_dir:           "/home/linok/Documents/xp12_dataset"
-    max_runways:          1000
-    episodes_per_launch:  50                      # restart XPlane to avoid buggy behavior
+    max_runways:          10
+    episodes_per_launch:  75                      # restart XPlane to avoid buggy behavior
     fps:                  50                      # don't forget to update this in XPlane-12
     sim_speed:            5                       # fps / sim_speed = fps of gt
+    skip_first_frames:    50                      # changing time can cause visual effects
+    skip_last_frames:     0                       # descent.stop_dist ends the capture now, so nothing
+                                                  # needs trimming off the end. raise it if the last few
+                                                  # frames turn out to lag the recorder stopping
 
 airport:                                          # default is KSFO 28R
     airport_name:         "KSFO"
@@ -21,33 +25,46 @@ airport:                                          # default is KSFO 28R
     r1_long:              -122.3571551            # degrees
     r2_lat:               37.6287597              # degrees
     r2_long:              -122.3934389            # degrees
-    heading:              298.0                   # degrees
+    heading:              298.0                   # degrees true; informational only.
+                                                  # the plugin derives the runway axis from
+                                                  # r1/r2 rather than using this ILS bearing
     elev:                 3.9624                  # meters
-    ils_freq:             11170                   # MHz / 100
+    ils_freq:             11170                   # 10s of kHz, i.e. 11170 = 111.70 MHz
 
 descent:
-    start_dist:           2.7                     # nautical miles
-    start_altitude:       null                    # meters above runway; optional override, can be null
+    start_dist:           3000                    # meters before the threshold; capture starts here
+    stop_dist:            150                     # meters before the threshold; capture stops here and
+                                                  # the aircraft lands unrecorded. 150 m keeps the whole
+                                                  # runway in frame for ~99% of episodes (100 m: ~90%)
+    start_altitude:       200                     # meters above runway; optional override, can be null
     descent_speed:        80.0                    # knots
     descent_angle:        3.0                     # degrees
+    flare_alt:            25.0           
+    flare_start_pitch:    0.10   
+    flare_end_pitch:      0.50 
+    touchdown_alt:        2.5
 
-environment:
+environment:                                      # LOCKED DOWN: every source of variation is currently
+                                                  # zeroed out. Raise these to re-enable randomization;
+                                                  # units below are the X-Plane dataref units, see
+                                                  # Resources/plugins/DataRefs.txt
     wind:
-        max_wind_speed:   3.0                     # km/h
-        max_gust_speed:   0.5                     # km/h
-        max_turbulence:   0.05                    # 0 <= x <= 1.0
+        max_wind_speed:   0.0                     # m/s      (was documented as km/h; wind_speed_msc is m/s)
+        max_gust_speed:   0.0                     # m/s
+        max_turbulence:   0.0                     # 0 <= x <= 10.0, a bare scale (NOT 0-1)
     visibility:
-        min_visibility:   10.0                    # practically x < 15
-        clear_chance:     0.75
+        min_visibility:   15.0                    # statute miles; only used when the clear roll fails
+        clear_chance:     1.0                     # 1.0 => always the clear 15 sm case
     clouds:
         num_layers:       3
-        bases:            [1500, 4000, 7000]      # meters
-        tops:             [1800, 4300, 7300]      # meters
-        coverage:         [0.8, 0.6, 0.3]
+        bases:            [1500, 4000, 7000]      # meters MSL
+        tops:             [1800, 4300, 7300]      # meters MSL
+        coverage:         [0.0, 0.0, 0.0]         # 0 <= x <= 1.0 per layer
     rain:
-        max_rain:         0.5                     # 0 <= x <= 1.0
-        rain_chance:      0.3
+        max_rain:         0.0                     # 0 <= x <= 1.0
+        rain_chance:      0.0
     time:
-        daytime_chance:   0.9
-        timezone_offset:  -8                      # relative to GMT
+        daytime_chance:   1.0
+        timezone_offset:  -8                      # relative to GMT; unused, the plugin resolves the
+                                                  # timezone from the runway coordinates
     
