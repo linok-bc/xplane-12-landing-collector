@@ -16,14 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils.dat_utils import parse_runways_dat
 from utils.general_utils import (
     degrees_to_rads,
-    degrees_to_meters,
     get_start_position,
     euler_to_quaternion,
     mat4_mul_vec4,
     project_local_to_pixel,
-    get_runway_points,
-    clip_polygon_to_screen,
-    clip_near_plane,
+    get_runway_corners,
     compute_bearing
 )
 
@@ -61,19 +58,30 @@ R1_LAT              = ap.r1_lat
 R1_LONG             = ap.r1_long
 R2_LAT              = ap.r2_lat
 R2_LONG             = ap.r2_long
-HEADING             = ap.heading
 ELEV                = ap.elev
 ILS_FREQ            = ap.ils_freq
-# this needs to be computed
-RUNWAY_POINTS       = get_runway_points(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH, ELEV)
+# these need to be computed.
+# RUNWAY_AXIS is the bearing of the pavement, derived from the two runway-end
+# coordinates -- NOT the ILS localiser bearing in the dat file. Everything we log is
+# measured against the runway the labels describe, so the two must not be mixed.
+# dat_process.py guarantees they agree to within MAX_BEARING_MISMATCH degrees.
+RUNWAY_AXIS         = compute_bearing(R1_LAT, R1_LONG, R2_LAT, R2_LONG)
+# the two runway-end elevations get replaced by terrain probes once scenery is loaded;
+# the published airport elevation is only the fallback
+RUNWAY_CORNERS      = get_runway_corners(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH, ELEV, ELEV)
 
 # === DESCENT ===
 START_DIST          = desc.start_dist
+STOP_DIST           = desc.stop_dist
 DESCENT_SPEED       = desc.descent_speed
 DESCENT_ANGLE       = desc.descent_angle
+FLARE_ALT           = desc.flare_alt
+FLARE_START_PITCH   = desc.flare_start_pitch
+FLARE_END_PITCH     = desc.flare_end_pitch
+TOUCHDOWN_ALT       = desc.touchdown_alt
 # this needs to be computed
 START_LAT, START_LONG, START_ALT= get_start_position(
-    R1_LAT, R1_LONG, HEADING, ELEV, START_DIST, DESCENT_ANGLE
+    R1_LAT, R1_LONG, RUNWAY_AXIS, ELEV, START_DIST, DESCENT_ANGLE
 )
 # allow START_ALT to be overridden since sometimes the AI fails
 if conf.descent.start_altitude:
@@ -127,12 +135,16 @@ class PythonInterface:
         self._world_mat = [0.0] * 16
         self._proj_mat = [0.0] * 16
         self._episodes_this_launch = 0
+        self._probe = None
+        self._thr_y = 0.0          # OpenGL y of the runway surface at the threshold
+        self._capture_done = False
 
     def __reset_monitor__(self):
         self._mon_accum = 0
         self._mon_pose_logger = []
         self._mon_position_logger = []
         self._mon_poly_logger = []
+        self._capture_done = False
 
 
     def XPluginStart(self):
@@ -162,16 +174,17 @@ class PythonInterface:
             "theta":                "sim/flightmodel/position/theta",
             "phi":                  "sim/flightmodel/position/phi",
             
-            # velocity in local frame
-            "vx":                   "sim/flightmodel/position/local_vx",
-            "vy":                   "sim/flightmodel/position/local_vy",
-            "vz":                   "sim/flightmodel/position/local_vz",
-            
-            # roll, pitch, and yaw rotation rates in local frame
+            # Euler-angle rotation rates; for some reason if I don't register these, the plane just crashes???
+            # DO NOT REMOVE???
             "P":                    "sim/flightmodel/position/P",
             "Q":                    "sim/flightmodel/position/Q",
             "R":                    "sim/flightmodel/position/R",
             
+            # velocity in local frame
+            "vx":                   "sim/flightmodel/position/local_vx",
+            "vy":                   "sim/flightmodel/position/local_vy",
+            "vz":                   "sim/flightmodel/position/local_vz",
+             
             # monitoring air and groundspeed
             "agl":                  "sim/flightmodel/position/y_agl",
             "gnd":                  "sim/flightmodel/failures/onground_any",
@@ -194,7 +207,9 @@ class PythonInterface:
             "hsi_src":              "sim/cockpit2/radios/actuators/HSI_source_select_pilot",
 
             # weather control
-            "weather_source":       "sim/weather/region/weather_source",
+            # weather_source is READ-ONLY, so writing it does nothing. change_mode is the
+            # writable one; 3 = Static, which stops the sim drifting our values back
+            "change_mode":          "sim/weather/region/change_mode",
             "update_immediately":   "sim/weather/region/update_immediately",
             
             # wind control
@@ -256,6 +271,10 @@ class PythonInterface:
         # keep track of transformation matrices during draw phase
         xp.registerDrawCallback(self._draw_cb, phase=xp.Phase_Window, after=0, refCon=None)
 
+        # terrain probe, used to put the runway polygon on the actual ground rather than
+        # on the airport's single published elevation
+        self._probe = xp.createProbe()
+
         # make interactable button in X-Plane
         idx = xp.appendMenuItem(xp.findPluginsMenu(), "Begin Data Collection", 0)
         self.menu_id = xp.createMenu("Begin Data Collection", xp.findPluginsMenu(), idx, self._menu_cb)
@@ -267,6 +286,9 @@ class PythonInterface:
 
 
     def XPluginDisable(self):
+        if self._probe is not None:
+            xp.destroyProbe(self._probe)
+            self._probe = None
         if self.menu_id:
             xp.unregisterDrawCallback(self._draw_cb, phase=xp.Phase_Window, after=0, refCon=None)
             xp.destroyMenu(self.menu_id)
@@ -305,7 +327,9 @@ class PythonInterface:
         xp.setDatavf(self.dr["wind_direction"], dirs, 0, 13)
         xp.setDatavf(self.dr["wind_turbulence"], turbs, 0, 13)
         
-        self._mon_condition_logger['wind'] = [base_speed, base_dir, turb]
+        # log the surface layer we actually wrote, gust included -- not base_speed,
+        # which is not what any layer ends up holding
+        self._mon_condition_logger['wind'] = [speeds[0], base_dir, turb]
 
 
 
@@ -431,10 +455,10 @@ class PythonInterface:
                     xp.commandOnce(self.cmd["quit"])
                     return
                 
-                # set up clouds + rain and increase sim speed
+                # set up clouds and increase sim speed. precipitation is rolled per
+                # episode in _start_next_flight, not once per launch
                 self._set_clouds()
-                self._randomize_precipitation()
-                xp.setDatai(self.dr["weather_source"], 1)
+                xp.setDatai(self.dr["change_mode"], 3)
                 xp.setDatai(self.dr["update_immediately"], 1)
                 xp.commandOnce(self.cmd["regen_weather"])
                 xp.setDatai(self.dr["sim_speed"], SIM_SPEED)
@@ -469,8 +493,8 @@ class PythonInterface:
         # reference global variables
         global AIRPORT, RUNWAY_NAME, RUNWAY_WIDTH
         global R1_LAT, R1_LONG, R2_LAT, R2_LONG
-        global HEADING, ELEV, ILS_FREQ
-        global RUNWAY_POINTS, START_LAT, START_LONG, START_ALT
+        global ELEV, ILS_FREQ
+        global RUNWAY_AXIS, RUNWAY_CORNERS, START_LAT, START_LONG, START_ALT
         global TIMEZONE, TIMEZONE_OFFSET
 
         # update global variables based on new parameters
@@ -481,14 +505,18 @@ class PythonInterface:
         R1_LONG = r['r1_long']
         R2_LAT = r['r2_lat']
         R2_LONG = r['r2_long']
-        HEADING = r['heading']
         ELEV = r['elev']
         ILS_FREQ = r['ils']
-        
-        # these needs to be computed
-        RUNWAY_POINTS = get_runway_points(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH, ELEV)
+
+        # these needs to be computed.
+        # r['heading'] is the ILS localiser bearing and is deliberately not used here;
+        # the pavement bearing is what the ground truth is measured against
+        RUNWAY_AXIS = compute_bearing(R1_LAT, R1_LONG, R2_LAT, R2_LONG)
+        # provisional corners at the published elevation; _place_on_approach re-derives
+        # them from terrain probes once the scenery around the airport has loaded
+        RUNWAY_CORNERS = get_runway_corners(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH, ELEV, ELEV)
         START_LAT, START_LONG, START_ALT= get_start_position(
-            R1_LAT, R1_LONG, HEADING, ELEV, START_DIST, DESCENT_ANGLE
+            R1_LAT, R1_LONG, RUNWAY_AXIS, ELEV, START_DIST, DESCENT_ANGLE
         )
         if conf.descent.start_altitude:
             START_ALT = conf.descent.start_altitude
@@ -508,11 +536,12 @@ class PythonInterface:
         # reset monitor variables
         self.__reset_monitor__()
 
-        # Randomize environment conditions (except cloud cover and precipitation)
+        # Randomize environment conditions (except cloud cover)
         self._randomize_wind()
         self._randomize_visibility()
+        self._randomize_precipitation()
         self._randomize_time()
-        xp.setDatai(self.dr["weather_source"], 1)
+        xp.setDatai(self.dr["change_mode"], 3)
         xp.setDatai(self.dr["update_immediately"], 1)
         xp.commandOnce(self.cmd["regen_weather"])
 
@@ -552,125 +581,142 @@ class PythonInterface:
         ias = xp.getDataf(self.dr["ias"])
         
         # --- THROTTLE: maintain target speed throughout ---
-        if agl > 40:
+        if agl > FLARE_ALT:
             # Simple speed control: if too fast reduce throttle, if too slow increase
             speed_error = ias - DESCENT_SPEED
             throttle = 0.5 - (speed_error / 40.0)
             throttle = max(0.0, min(1.0, throttle))
             xp.setDataf(self.dr["thro_cmd"], throttle)
         
-        # --- FLARE: below 50ft, take over from AP ---
-        if agl < 40:
+        # --- FLARE: below FLARE_ALT take over from AP ---
+        if agl < FLARE_ALT and agl >= TOUCHDOWN_ALT:
             xp.setDatai(self.dr["override_joystick"], 1)
             
             # Hold wings level
             phi = xp.getDataf(self.dr["phi"])
             xp.setDataf(self.dr["yoke_roll"], max(-1.0, min(1.0, -phi / 25.0)))
             
-            # pitch: ramps from 0.3 at 50ft
-            target_pitch = 0.3 + (1.0 - agl/40.0) * 0.2
-            # throttle: ramps from 0.2 at 50ft
-            target_throttle = 0.2 - (1.0 - agl/40.0) * 0.15
+            # Flare progress: 0.0 at FLARE_ALT, 1.0 at ground
+            progress = 1.0 - (agl / FLARE_ALT)
+            progress = max(0.0, min(1.0, progress))
+            
+            # Pitch ramps up gently
+            target_pitch = FLARE_START_PITCH + progress * (FLARE_END_PITCH - FLARE_START_PITCH)
             xp.setDataf(self.dr["yoke_pitch"], target_pitch)
+            
+            # Throttle smoothly to idle (no hard step)
+            target_throttle = 0.15 * (1.0 - progress)
             xp.setDataf(self.dr["thro_cmd"], target_throttle)
-        
+
+
         # Touchdown
-        if agl < 5 or xp.getDatai(self.dr["gnd"]):
+        if agl < TOUCHDOWN_ALT or xp.getDatai(self.dr["gnd"]):
             xp.setDatai(self.dr["override_joystick"], 0)
             xp.setDataf(self.dr["thro_cmd"], 0.0)
-            xp.commandOnce(self.cmd["toggle_movie"])
-            with suppress(Exception): xp.unregisterFlightLoopCallback(self._monitor_loop)
-            
-            # write monitored conditions to file
-            gt_meta_path = os.path.join(self._run_dir, 'meta.txt')
-            gt_pose_path = os.path.join(self._run_dir, 'pose.txt')
-            gt_position_path = os.path.join(self._run_dir, 'position.txt')
-            gt_poly_path = os.path.join(self._run_dir, 'poly.txt')
 
-            with open(gt_meta_path, 'w') as fp:
-                fp.write(f'{AIRPORT} {RUNWAY_NAME}\n')
-                env_cond = ' '.join([
-                    str(self._mon_condition_logger['wind'][0]),
-                    str(self._mon_condition_logger['wind'][1]),
-                    str(self._mon_condition_logger['wind'][2]),
-                    str(self._mon_condition_logger['vis']),
-                    str(self._mon_condition_logger['rain']),
-                    self._mon_condition_logger['daytime'],
-                ])
-                fp.write(env_cond + '\n')
-
-            with open(gt_pose_path, 'w') as fp:
-                for q in self._mon_pose_logger:
-                    fp.write(f'{q[0]} {q[1]} {q[2]} {q[3]}\n')
-            
-            with open(gt_position_path, 'w') as fp:
-                for x, y, z in self._mon_position_logger:
-                    fp.write(f'{x} {y} {z}\n')
-
-            with open(gt_poly_path, 'w') as fp:
-                for poly in self._mon_poly_logger:
-                    poly = [f"{p[0]} {p[1]}" for p in poly]
-                    if len(poly) == 0:
-                        fp.write(f'\n')
-                    else:
-                        fp.write(' '.join(poly) + '\n')
+            # capture normally ended back at STOP_DIST. this covers the aircraft that
+            # never got that close: landed short, or the approach fell apart
+            if not self._capture_done:
+                xp.log(" WARN: touched down before reaching the capture cutoff")
+                self._finish_capture()
 
             # move onto next flight; slightly delay to avoid race conditions
             self._runway_idx += 1
             self._episodes_this_launch += 1
             xp.registerFlightLoopCallback(self._advance_cb, interval=0.5)
             return 0
-        
+
         return -1
+
+
+
+    # ============================================================
+    # END OF CAPTURE
+    #
+    # The recorder and the ground-truth stream MUST stop on the same
+    # event: convert_to_yolo.py pairs them by taking the last N of
+    # each, so any drift between the two stop points silently shifts
+    # every frame/label pairing in the episode.
+    # ============================================================
+    def _finish_capture(self):
+        if self._capture_done:
+            return
+        self._capture_done = True
+
+        xp.commandOnce(self.cmd["toggle_movie"])
+        with suppress(Exception): xp.unregisterFlightLoopCallback(self._monitor_loop)
+
+        # write monitored conditions to file
+        gt_meta_path = os.path.join(self._run_dir, 'meta.txt')
+        gt_pose_path = os.path.join(self._run_dir, 'pose.txt')
+        gt_position_path = os.path.join(self._run_dir, 'position.txt')
+        gt_poly_path = os.path.join(self._run_dir, 'poly.txt')
+
+        with open(gt_meta_path, 'w') as fp:
+            fp.write(f'{AIRPORT} {RUNWAY_NAME}\n')
+            env_cond = ' '.join([
+                str(self._mon_condition_logger['wind'][0]),
+                str(self._mon_condition_logger['wind'][1]),
+                str(self._mon_condition_logger['wind'][2]),
+                str(self._mon_condition_logger['vis']),
+                str(self._mon_condition_logger['rain']),
+                self._mon_condition_logger['daytime'],
+            ])
+            fp.write(env_cond + '\n')
+
+        # columns are: yaw pitch roll
+        with open(gt_pose_path, 'w') as fp:
+            for yaw, pitch, roll in self._mon_pose_logger:
+                # positive yaw   -> nose right of the runway heading
+                # positive pitch -> nose up
+                # positive roll  -> right wing down
+                fp.write(f'{yaw} {pitch} {roll}\n')
+
+        # columns are: along height right
+        with open(gt_position_path, 'w') as fp:
+            for along, height, right in self._mon_position_logger:
+                # along  -> meters past the threshold, negative on approach
+                # height -> meters above the runway surface at the threshold
+                # right  -> meters right of the centerline, facing down the runway
+                fp.write(f'{along} {height} {right}\n')
+
+        # written last: _count_completed_episodes uses this file as the resume sentinel
+        with open(gt_poly_path, 'w') as fp:
+            for poly in self._mon_poly_logger:
+                poly = [f"{p[0]} {p[1]}" for p in poly]
+                if len(poly) == 0:
+                    fp.write(f'\n')
+                else:
+                    fp.write(' '.join(poly) + '\n')
 
 
 
     def _get_runway_polygon(self):
         """
-        Project runway corners to screen pixels. Returns list of (x_norm, y_norm) 
-        normalized 0-1, or None if runway not visible.
+        Project the four runway corners to normalized image coordinates, in boundary
+        order (near-left, far-left, far-right, near-right).
+
+        No polygon clipping: capture stops at STOP_DIST precisely so the whole rectangle
+        stays inside the frame, which is also what makes a 4-point label sufficient.
+        Returns None only if a corner has gone behind the camera.
         """
-        # Read matrices
         sw = xp.getDatai(self.dr["screen_w"])
         sh = xp.getDatai(self.dr["screen_h"])
-    
+
         if sw <= 0 or sh <= 0:
             return None
-    
-        # Project each point
-        screen_pts = []
-        behind_flags = []
-        clips = []
-        for lat, lon, elev in RUNWAY_POINTS:
-            lx, ly, lz = xp.worldToLocal(lat, lon, elev)
-            px, py, behind, clip = project_local_to_pixel(lx, ly, lz, self._world_mat, self._proj_mat, sw, sh)
-            screen_pts.append((px, py))
-            behind_flags.append(behind)
-            clips.append(clip)
-    
-        # If all behind camera, not visible
-        if all(behind_flags):
-            return None
-    
-        # Clip near plane
-        if any(behind_flags):
-            poly = clip_near_plane(clips, screen_pts, behind_flags, sw, sh)
-        else:
-            poly = list(screen_pts)
-    
-        # Clip to screen bounds
-        poly = clip_polygon_to_screen(poly, sw, sh)
-    
-        if len(poly) < 3:
-            return None
-    
-        # Normalize to 0-1 (flip Y: screen bottom-left to top-left origin for YOLO)
+
         normalized = []
-        for px, py in poly:
+        for lat, lon, elev in RUNWAY_CORNERS:
+            lx, ly, lz = xp.worldToLocal(lat, lon, elev)
+            px, py, behind = project_local_to_pixel(lx, ly, lz, self._world_mat, self._proj_mat, sw, sh)
+            if behind:
+                return None
+            # normalize to 0-1, flipping Y from OpenGL bottom-left to YOLO top-left origin
             nx = max(0.0, min(1.0, px / sw))
             ny = max(0.0, min(1.0, 1.0 - py / sh))
             normalized.append((nx, ny))
-    
+
         return normalized
 
 
@@ -680,42 +726,76 @@ class PythonInterface:
     # ============================================================
     def _monitor_loop(self, since_last, elapsed, counter, refcon):
         self._mon_accum += since_last
-        agl = xp.getDataf(self.dr["agl"])
 
-        # capture quaternions for rotation
-        q = [0.0] * 4
-        xp.getDatavf(self.dr['q'], q, 0, 4)
+        # capture yaw, pitch, roll for rotation
+        yaw   = (xp.getDataf(self.dr["psi"]) - RUNWAY_AXIS + 540.0) % 360.0 - 180.0
+        pitch = xp.getDataf(self.dr["theta"])
+        roll  = xp.getDataf(self.dr["phi"])
 
-        # capture location
+        # capture location as an offset from the threshold, in OpenGL local coords
         rx, ry, rz = xp.worldToLocal(R1_LAT, R1_LONG, ELEV)
-        x = xp.getDatad(self.dr['lx']) - rx
-        y = xp.getDataf(self.dr['agl'])
-        z = xp.getDatad(self.dr['lz']) - rz
-        
-        # converted captured locations from absolute offset to relative to the landing strip
-        h = math.radians(HEADING)
+        dx = xp.getDatad(self.dr['lx']) - rx
+        dz = xp.getDatad(self.dr['lz']) - rz
+        # height above the runway surface. NOT y_agl, which measures against whatever
+        # terrain happens to be under the aircraft and wanders off the glidepath
+        height = xp.getDatad(self.dr['ly']) - self._thr_y
+
+        # convert the raw east/south offset into the runway frame
+        h = math.radians(RUNWAY_AXIS)
         cos_h, sin_h = math.cos(h), math.sin(h)
-        _x = x * sin_h - z * cos_h   # positive = past threshold (down the runway)
-        _z = x * cos_h + z * sin_h   # positive = right of centerline (facing forward)
-        x, z = _x, _z
+        along = dx * sin_h - dz * cos_h   # positive = past threshold (down the runway)
+        right = dx * cos_h + dz * sin_h   # positive = right of centerline (facing forward)
+
+        # stop capturing before the near corners start dropping out of frame. the flare
+        # loop keeps flying and lands the aircraft, just without recording it
+        if along > -STOP_DIST:
+            self._finish_capture()
+            return 0
 
         # get polygon of runway
         poly = self._get_runway_polygon()
 
         # write to loggers for future writing
-        self._mon_pose_logger.append(q)
-        self._mon_position_logger.append([x, y, z])
-        if poly:
-            self._mon_poly_logger.append(poly)
-        else:
-            self._mon_poly_logger.append([])
+        self._mon_pose_logger.append([yaw, pitch, roll])
+        self._mon_position_logger.append([along, height, right])
+        self._mon_poly_logger.append(poly if poly else [])
 
         # else, delay next callback based on intended FPS
         return (1 / FPS)
 
 
 
+    def _probe_surface(self, lat, lon, fallback_elev):
+        """
+        Find the actual ground at a lat/lon. apt.dat publishes a single elevation for the
+        whole airport, which can sit tens of meters off the real runway surface; probing
+        fixes both the polygon's altitude and the height we log.
+
+        [out]
+            local_y (float): OpenGL y of the ground
+            elev (float): the same point as an MSL elevation in meters
+        """
+        px, py, pz = xp.worldToLocal(lat, lon, fallback_elev)
+        if self._probe is not None:
+            info = xp.probeTerrainXYZ(self._probe, px, py, pz)
+            if info is not None and info.result == xp.ProbeHitTerrain:
+                # local y is linear in MSL elevation over a patch this small, so the
+                # offset between probed and requested y carries straight over to MSL
+                return info.locationY, fallback_elev + (info.locationY - py)
+        xp.log(f" WARN: terrain probe missed at {lat},{lon}; using published elevation")
+        return py, fallback_elev
+
+
     def _place_on_approach(self, since_last, elapsed, counter, refcon):
+        global RUNWAY_CORNERS
+
+        # scenery is loaded by now, so pin the runway to the ground it is actually on
+        self._thr_y, thr_elev = self._probe_surface(R1_LAT, R1_LONG, ELEV)
+        _, far_elev = self._probe_surface(R2_LAT, R2_LONG, ELEV)
+        RUNWAY_CORNERS = get_runway_corners(
+            R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH, thr_elev, far_elev
+        )
+
         # Convert both points to X-Plane local coords
         tx, ty, tz = xp.worldToLocal(R1_LAT, R1_LONG, ELEV)
         sx, sy, sz = xp.worldToLocal(START_LAT, START_LONG, START_ALT)
@@ -757,12 +837,15 @@ class PythonInterface:
         xp.setDataf(self.dr["thro_cmd"], 0.7)
 
         # === RADIOS ===
+        # heading_mag and nav1_obs_degm are both degrees MAGNETIC; RUNWAY_AXIS is true.
+        # the conversion uses the user's current location, which is this airport by now
+        runway_axis_mag = xp.degTrueToDegMagnetic(RUNWAY_AXIS)
         xp.setDatai(self.dr["hsi_src"], 0)
         xp.setDatai(self.dr["nav1"], ILS_FREQ)
-        xp.setDataf(self.dr["nav1_obs"], HEADING)
+        xp.setDataf(self.dr["nav1_obs"], runway_axis_mag)
 
         # === AUTOPILOT ===
-        xp.setDataf(self.dr["ap_hdg"], HEADING)
+        xp.setDataf(self.dr["ap_hdg"], runway_axis_mag)
         xp.setDatai(self.dr["ap"], 2)
         xp.commandOnce(self.cmd["servos"])
         xp.commandOnce(self.cmd["approach"])

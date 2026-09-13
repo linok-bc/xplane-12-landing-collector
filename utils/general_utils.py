@@ -1,6 +1,12 @@
 import math
 
 
+# meters per degree of latitude (spherical approximation). Longitude is this scaled
+# by cos(latitude). Used by everything in this file so that the start position and the
+# runway corners are derived on the same footing.
+M_PER_DEG = 111320.0
+
+
 
 def degrees_to_rads(deg: float):
     """
@@ -14,19 +20,6 @@ def degrees_to_rads(deg: float):
 
 
 
-def degrees_to_meters(deg: float):
-    """
-    [in]
-        deg (float): the degrees to turn into meters; longitudes may need to be scaled after this
-    
-    [out]
-        out (float): the distance in meters
-    """
-    out = deg * 60 * 1852
-    return out
-
-
-
 def get_start_position(
         rwy_lat: float,
         rwy_lon: float,
@@ -36,28 +29,31 @@ def get_start_position(
         start_gamma
     ):
     """
+    Back off from the threshold along the reciprocal of the runway bearing.
+
     [in]
         rwy_lat (float): runway latitude in degrees (Earth distance)
         rwy_lon (float): runway longitude in degrees (Earth distance)
-        rwy_head (float): runway orientation in degrees (angles)
+        rwy_head (float): runway orientation in degrees TRUE (angles)
         rwy_elev (float): runway elevation above sea level in meters
-        start_dist (float): distance to start from in nautical miles
-        start_gamma (float): approach angle
+        start_dist (float): distance to start from, in METERS
+        start_gamma (float): approach angle in degrees
 
     [out]
         start_lat (float): starting latitude in degrees
         start_lon (float): starting longitude in degrees
-        start_alt (float): starting altitude of the plane in meters
+        start_alt (float): starting altitude of the plane in meters MSL
     """
     # convert start_dist to degrees
-    start_dist = start_dist / 60
+    start_dist_deg = start_dist / M_PER_DEG
 
     # apply offset to rwy_lat/long based on heading
-    start_lat = rwy_lat - start_dist * math.cos(degrees_to_rads(rwy_head))
-    start_lon = rwy_lon - start_dist * math.sin(degrees_to_rads(rwy_head)) / math.cos(degrees_to_rads(rwy_lat))
-    
-    # calculate starting angle
-    start_alt = rwy_elev + degrees_to_meters(start_dist) * math.tan(degrees_to_rads(start_gamma + 0.5))
+    start_lat = rwy_lat - start_dist_deg * math.cos(degrees_to_rads(rwy_head))
+    start_lon = rwy_lon - start_dist_deg * math.sin(degrees_to_rads(rwy_head)) / math.cos(degrees_to_rads(rwy_lat))
+
+    # calculate starting angle. the extra half degree puts us slightly above the
+    # glideslope so the autopilot captures it from above rather than chasing it up
+    start_alt = rwy_elev + start_dist * math.tan(degrees_to_rads(start_gamma + 0.5))
 
     return start_lat, start_lon, start_alt
 
@@ -98,124 +94,82 @@ def mat4_mul_vec4(m, v):
         m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3],
     ]
 
+
+
 def project_local_to_pixel(lx, ly, lz, world_mat, proj_mat, screen_w, screen_h):
+    """
+    Project an OpenGL local-coordinate point to pixels.
+
+    [out]
+        px, py (float): pixel coordinates, ORIGIN BOTTOM-LEFT (OpenGL convention).
+                        meaningless when behind is True
+        behind (bool): True if the point is at or behind the camera plane
+    """
     eye = mat4_mul_vec4(world_mat, [lx, ly, lz, 1.0])
     clip = mat4_mul_vec4(proj_mat, eye)
 
     if clip[3] <= 0.0:
-        return (clip[0], clip[1], True, clip)
+        return (0.0, 0.0, True)
 
     ndc_x = clip[0] / clip[3]
     ndc_y = clip[1] / clip[3]
 
     px = (ndc_x + 1.0) * 0.5 * screen_w
     py = (ndc_y + 1.0) * 0.5 * screen_h
-    return (px, py, False, clip)
+    return (px, py, False)
 
 
-def get_runway_points(lat1, lon1, lat2, lon2, width_m, elev, n=20):
+
+def get_runway_corners(lat1, lon1, lat2, lon2, width_m, elev_near, elev_far):
     """
-    fetch the coordinates of each runway center, then convert to a polygon
+    The four corners of the runway rectangle, in boundary order:
+
+        near-left, far-left, far-right, near-right
+
+    where 'near' is the (lat1, lon1) landing threshold and left/right are as seen
+    from the cockpit on approach to that threshold.
+
+    Each end takes its own elevation so that terrain-probed surface heights can be
+    passed in; using a single published airport elevation puts the polygon several
+    meters off the ground on a sloped runway, which dominates the label error on
+    short final.
 
     [in]
-        lat1 (float): latitude of nearside runway edge
-        long1 (float): longitude of nearside runway edge
-        lat2 (float): latitude of farside runway edge
-        long2 (float): longitude of farside runway edge
+        lat1, lon1 (float): landing threshold (near end)
+        lat2, lon2 (float): far end of the runway
         width_m (float): the width of the runway in meters
-        n (int), default=20: number of points to represent each half of the polygon
+        elev_near (float): surface elevation at the near end, meters MSL
+        elev_far (float): surface elevation at the far end, meters MSL
     """
-    m_per_deg_lat = 111320.0
-    m_per_deg_lon = 111320.0 * math.cos(math.radians((lat1 + lat2) / 2))
+    m_per_deg_lat = M_PER_DEG
+    m_per_deg_lon = M_PER_DEG * math.cos(math.radians((lat1 + lat2) / 2))
 
-    dx = (lon2 - lon1) * m_per_deg_lon
-    dy = (lat2 - lat1) * m_per_deg_lat
+    dx = (lon2 - lon1) * m_per_deg_lon   # east component, meters
+    dy = (lat2 - lat1) * m_per_deg_lat   # north component, meters
     length = math.sqrt(dx*dx + dy*dy)
-    
-    # Perpendicular offset
-    perp_lat = -dx / length * (width_m / 2) / m_per_deg_lat
-    perp_lon =  dy / length * (width_m / 2) / m_per_deg_lon
 
-    left, right = [], []
-    for i in range(n + 1):
-        frac = i / n
-        lat = lat1 + frac * (lat2 - lat1)
-        lon = lon1 + frac * (lon2 - lon1)
-        left.append((lat + perp_lat, lon + perp_lon, elev))
-        right.append((lat - perp_lat, lon - perp_lon, elev))
+    # rotating the along-track unit vector (dx, dy) by -90 degrees gives (dy, -dx),
+    # which points to the RIGHT of the direction of travel
+    right_lat = -dx / length * (width_m / 2) / m_per_deg_lat
+    right_lon =  dy / length * (width_m / 2) / m_per_deg_lon
 
-    return left + list(reversed(right))
+    near_left  = (lat1 - right_lat, lon1 - right_lon, elev_near)
+    far_left   = (lat2 - right_lat, lon2 - right_lon, elev_far)
+    far_right  = (lat2 + right_lat, lon2 + right_lon, elev_far)
+    near_right = (lat1 + right_lat, lon1 + right_lon, elev_near)
 
-def clip_polygon_to_screen(vertices, screen_w, screen_h):
-    """
-    Sutherland-Hodgman clipping of a polygon to the screen rectangle.
-    vertices: list of (x, y) tuples.
-    Returns clipped list of (x, y) tuples.
-    """
-    def clip_edge(poly, x0, y0, x1, y1):
-        """Clip polygon against one edge defined by line from (x0,y0) to (x1,y1). 
-           Points to the LEFT of the edge (interior) are kept."""
-        if not poly:
-            return []
-        result = []
-        for i in range(len(poly)):
-            curr = poly[i]
-            prev = poly[i - 1]
-            curr_side = (x1 - x0) * (curr[1] - y0) - (y1 - y0) * (curr[0] - x0)
-            prev_side = (x1 - x0) * (prev[1] - y0) - (y1 - y0) * (prev[0] - x0)
-            if curr_side >= 0:
-                if prev_side < 0:
-                    result.append(_intersect(prev, curr, x0, y0, x1, y1))
-                result.append(curr)
-            elif prev_side >= 0:
-                result.append(_intersect(prev, curr, x0, y0, x1, y1))
-        return result
+    return [near_left, far_left, far_right, near_right]
 
-    def _intersect(p1, p2, x0, y0, x1, y1):
-        dx, dy = x1 - x0, y1 - y0
-        dp_x, dp_y = p2[0] - p1[0], p2[1] - p1[1]
-        denom = dp_x * dy - dp_y * dx
-        if abs(denom) < 1e-10:
-            return p2
-        t = ((x0 - p1[0]) * dy - (y0 - p1[1]) * dx) / denom
-        return (p1[0] + t * dp_x, p1[1] + t * dp_y)
 
-    # Clip against all 4 screen edges (defined counter-clockwise)
-    poly = list(vertices)
-    poly = clip_edge(poly, 0, 0, screen_w, 0)          # bottom
-    poly = clip_edge(poly, screen_w, 0, screen_w, screen_h)  # right
-    poly = clip_edge(poly, screen_w, screen_h, 0, screen_h)  # top
-    poly = clip_edge(poly, 0, screen_h, 0, 0)          # left
-    return poly
-
-def clip_near_plane(clips, screen_pts, behind_flags, sw, sh):
-    NEAR_EPS = 0.01
-    n = len(screen_pts)
-    result = []
-    for i in range(n):
-        j = (i + 1) % n
-        if not behind_flags[i]:
-            result.append(screen_pts[i])
-        if behind_flags[i] != behind_flags[j]:
-            w_i = clips[i][3]
-            w_j = clips[j][3]
-            t = (NEAR_EPS - w_i) / (w_j - w_i)
-            t = max(0.0, min(1.0, t))
-            interp = [clips[i][k] + t * (clips[j][k] - clips[i][k]) for k in range(4)]
-            if interp[3] > 0:
-                ndc_x = interp[0] / interp[3]
-                ndc_y = interp[1] / interp[3]
-                result.append(((ndc_x + 1.0) * 0.5 * sw, (ndc_y + 1.0) * 0.5 * sh))
-    return result
 
 def compute_bearing(lat1, lon1, lat2, lon2):
     """Initial true bearing from point 1 to point 2, in degrees (0=N, 90=E)."""
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dlon = math.radians(lon2 - lon1)
-    
+
     y = math.sin(dlon) * math.cos(phi2)
     x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
-    
+
     bearing = math.degrees(math.atan2(y, x))
     return (bearing + 360) % 360
