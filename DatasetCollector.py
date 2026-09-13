@@ -385,7 +385,7 @@ class PythonInterface:
 
 
     def _count_completed_episodes(self, output_dir):
-        """Count dirs with a 'poly.txt' sentinel — written last in _flare_loop."""
+        """Count dirs with a 'poly.txt' sentinel — written last in _finish_capture."""
         if not os.path.isdir(output_dir):
             return 0
         count = 0
@@ -420,6 +420,30 @@ class PythonInterface:
 
 
     # ============================================================
+    # END OF DATASET
+    #
+    # Raise the sentinel supervisor.bash waits on, then shut the sim
+    # down. Without this an unattended run reaches its last episode
+    # and then sits idle forever, holding the supervisor loop open.
+    # ============================================================
+    def _finish_dataset(self):
+        xp.log(" === Dataset complete ===")
+        self._is_running = False
+
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            Path(OUTPUT_DIR, "DONE").touch()
+        except Exception as e:
+            # still quit; a stuck sim is worse than a missing flag
+            xp.log(f" WARN: could not write the DONE flag: {e}")
+
+        # delayed so the last episode's writes land before the process goes away
+        with suppress(Exception): xp.unregisterFlightLoopCallback(self._quit_cb)
+        xp.registerFlightLoopCallback(self._quit_cb, interval=3.0)
+
+
+
+    # ============================================================
     # START BEHAVIOR
     # ============================================================
     def _menu_cb(self, menuRef, itemRef):
@@ -450,9 +474,7 @@ class PythonInterface:
                 self._runway_idx = completed
 
                 if completed >= max_runways:
-                    xp.log(" === Dataset complete ===")
-                    Path(OUTPUT_DIR, "DONE").touch()
-                    xp.commandOnce(self.cmd["quit"])
+                    self._finish_dataset()
                     return
                 
                 # set up clouds and increase sim speed. precipitation is rolled per
@@ -476,8 +498,7 @@ class PythonInterface:
     def _start_next_flight(self):
         # check if we are done; else, fetch the runway
         if self._runway_idx >= len(self._runways):
-            xp.log(" === All runways complete ===")
-            self._is_running = False
+            self._finish_dataset()
             return
         r = self._runways[self._runway_idx]
         counter = self._runway_idx + 1
