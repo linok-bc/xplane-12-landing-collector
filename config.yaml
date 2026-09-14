@@ -7,10 +7,12 @@ data_collection:
     autostart:            True
     screenshots_path:     "/home/linok/.local/share/Steam/steamapps/common/X-Plane 12/Output/screenshots"
     output_dir:           "/home/linok/Documents/xp12_dataset"
-    max_runways:          10
+    max_runways:          150
     episodes_per_launch:  75                      # restart XPlane to avoid buggy behavior
     fps:                  50                      # don't forget to update this in XPlane-12
     sim_speed:            5                       # fps / sim_speed = fps of gt
+    jpeg_quality:         95                      # frames are stored as JPEG; PNG costs 5.5x the
+                                                  # bytes on rendered sky gradients for no visible gain
     skip_first_frames:    50                      # changing time can cause visual effects
     skip_last_frames:     0                       # descent.stop_dist ends the capture now, so nothing
                                                   # needs trimming off the end. raise it if the last few

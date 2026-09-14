@@ -21,6 +21,7 @@ MAX_RUNWAYS = dc.max_runways
 SIM_SPEED = dc.sim_speed
 SKIP_FIRST = dc.skip_first_frames
 SKIP_LAST = dc.skip_last_frames
+JPEG_QUALITY = dc.jpeg_quality
 
 if __name__ == '__main__':
 
@@ -82,7 +83,11 @@ if __name__ == '__main__':
         os.makedirs(dname / 'pose', exist_ok=True)
         
         for idx in range(len(frames)):
-            cv2.imwrite(str(dname / 'images' / f'{idx:06d}.png'), frames[idx])
+            # JPEG, not PNG. These are rendered sim frames with large smooth sky
+            # gradients, close to the worst case for lossless compression: PNG cost
+            # 811 KB/frame against 224 KB at q95, and Ultralytics reads jpg natively.
+            cv2.imwrite(str(dname / 'images' / f'{idx:06d}.jpg'), frames[idx],
+                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             # an empty poly line means the runway was not projectable for that frame.
             # write a genuinely empty label ("no objects") rather than a bare class id,
             # which is a malformed YOLO row
