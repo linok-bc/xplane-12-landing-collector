@@ -598,15 +598,9 @@ class PythonInterface:
         if self._flare_startup < 2.0:
             return -1
         
+        agl = xp.getDataf(self.dr["agl"])
         ias = xp.getDataf(self.dr["ias"])
-
-        # Height above the RUNWAY, not above whatever terrain is underneath. y_agl drops
-        # as terrain rises on the approach, which used to trigger the flare a kilometre
-        # out -- throttle to idle, nose up, and the aircraft settled into the trees short
-        # of the runway. Real ground contact is still caught by the onground_any test in
-        # the touchdown branch below, so an approach that does hit terrain still ends.
-        agl = xp.getDatad(self.dr["ly"]) - self._thr_y
-
+        
         # --- THROTTLE: maintain target speed throughout ---
         if agl > FLARE_ALT:
             # Simple speed control: if too fast reduce throttle, if too slow increase
@@ -823,18 +817,11 @@ class PythonInterface:
             R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWAY_WIDTH, thr_elev, far_elev
         )
 
-        # Convert both points to X-Plane local coords. The threshold's height comes from
-        # the probe, not apt.dat: the published airport elevation can be tens of metres
-        # off the runway surface, and measuring start_altitude from it placed BGTL 08T
-        # 77 m too high -- 104 m above its glideslope, which it never recovered from.
-        tx, _, tz = xp.worldToLocal(R1_LAT, R1_LONG, ELEV)
-        ty = self._thr_y
-        sx, _, sz = xp.worldToLocal(START_LAT, START_LONG, START_ALT)
-
-        # START_ALT is a height above the runway when overridden, and MSL otherwise;
-        # either way we want the height above the probed surface
-        start_height = START_ALT if conf.descent.start_altitude else (START_ALT - ELEV)
-        sy = ty + start_height
+        # Convert both points to X-Plane local coords
+        tx, ty, tz = xp.worldToLocal(R1_LAT, R1_LONG, ELEV)
+        sx, sy, sz = xp.worldToLocal(START_LAT, START_LONG, START_ALT)
+        if conf.descent.start_altitude:
+            sy = ty + START_ALT
 
         # Compute true heading from start to threshold using local coords
         # X-Plane: +X=east, +Y=up, +Z=south
