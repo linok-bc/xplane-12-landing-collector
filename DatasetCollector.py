@@ -65,6 +65,9 @@ ILS_FREQ            = ap.ils_freq
 # coordinates -- NOT the ILS localiser bearing in the dat file. Everything we log is
 # measured against the runway the labels describe, so the two must not be mixed.
 # dat_process.py guarantees they agree to within MAX_BEARING_MISMATCH degrees.
+# it is a TRUE-north bearing: fine for placing the start point and setting the
+# autopilot, but NOT for the logged along/right/yaw, which live in the local frame
+# (see _monitor_loop).
 RUNWAY_AXIS         = compute_bearing(R1_LAT, R1_LONG, R2_LAT, R2_LONG)
 # the two runway-end elevations get replaced by terrain probes once scenery is loaded;
 # the published airport elevation is only the fallback
@@ -73,6 +76,7 @@ RUNWAY_CORNERS      = get_runway_corners(R1_LAT, R1_LONG, R2_LAT, R2_LONG, RUNWA
 # === DESCENT ===
 START_DIST          = desc.start_dist
 STOP_DIST           = desc.stop_dist
+MIN_PATH_ANGLE      = desc.min_path_angle
 DESCENT_SPEED       = desc.descent_speed
 DESCENT_ANGLE       = desc.descent_angle
 FLARE_ALT           = desc.flare_alt
@@ -748,13 +752,22 @@ class PythonInterface:
     def _monitor_loop(self, since_last, elapsed, counter, refcon):
         self._mon_accum += since_last
 
+        # runway axis in the local frame, from both ends. local -Z points at true north
+        # only at the frame's origin, so RUNWAY_AXIS (true north) is rotated against the
+        # local offsets and psi (which is measured from the Z axis) by the meridian
+        # convergence between origin and airport: up to ~0.5 deg at high latitude, i.e.
+        # 5-13 m of cross-track at 1-1.5 km. recomputed every frame because the origin
+        # moves when scenery shifts
+        rx, ry, rz = xp.worldToLocal(R1_LAT, R1_LONG, ELEV)
+        fx, fy, fz = xp.worldToLocal(R2_LAT, R2_LONG, ELEV)
+        h = math.atan2(fx - rx, -(fz - rz))
+
         # capture yaw, pitch, roll for rotation
-        yaw   = (xp.getDataf(self.dr["psi"]) - RUNWAY_AXIS + 540.0) % 360.0 - 180.0
+        yaw   = (xp.getDataf(self.dr["psi"]) - math.degrees(h) + 540.0) % 360.0 - 180.0
         pitch = xp.getDataf(self.dr["theta"])
         roll  = xp.getDataf(self.dr["phi"])
 
         # capture location as an offset from the threshold, in OpenGL local coords
-        rx, ry, rz = xp.worldToLocal(R1_LAT, R1_LONG, ELEV)
         dx = xp.getDatad(self.dr['lx']) - rx
         dz = xp.getDatad(self.dr['lz']) - rz
         # height above the runway surface. NOT y_agl, which measures against whatever
@@ -762,7 +775,6 @@ class PythonInterface:
         height = xp.getDatad(self.dr['ly']) - self._thr_y
 
         # convert the raw east/south offset into the runway frame
-        h = math.radians(RUNWAY_AXIS)
         cos_h, sin_h = math.cos(h), math.sin(h)
         along = dx * sin_h - dz * cos_h   # positive = past threshold (down the runway)
         right = dx * cos_h + dz * sin_h   # positive = right of centerline (facing forward)
@@ -770,6 +782,17 @@ class PythonInterface:
         # stop capturing before the near corners start dropping out of frame. the flare
         # loop keeps flying and lands the aircraft, just without recording it
         if along > -STOP_DIST:
+            self._finish_capture()
+            return 0
+
+        # also stop if the approach has sunk well below the glide path or under the
+        # runway. nothing else catches this: the flare loop goes by y_agl, so an aircraft
+        # settling into terrain short of the runway was recorded (and the runway,
+        # projected straight through the terrain in front of it, labelled) until impact
+        path_angle = math.degrees(math.atan2(height, -along))
+        if height <= 0.0 or path_angle < MIN_PATH_ANGLE:
+            xp.log(f" WARN: below the glide path ({path_angle:.2f} deg, {height:.1f} m "
+                   f"at {-along:.0f} m out); ending capture early")
             self._finish_capture()
             return 0
 

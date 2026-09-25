@@ -38,6 +38,11 @@ descent:
     stop_dist:            150                     # meters before the threshold; capture stops here and
                                                   # the aircraft lands unrecorded. 150 m keeps the whole
                                                   # runway in frame for ~99% of episodes (100 m: ~90%)
+    min_path_angle:       2.0                     # degrees; capture also stops once the aircraft sinks
+                                                  # below this angle as seen from the threshold, or below
+                                                  # the threshold itself. clean approaches bottom out at
+                                                  # ~2.9 deg; ones that flew into terrain short crossed
+                                                  # 2.0 deg 1.3-1.5 km out
     start_altitude:       200                     # meters above runway; optional override, can be null
     descent_speed:        80.0                    # knots
     descent_angle:        3.0                     # degrees
